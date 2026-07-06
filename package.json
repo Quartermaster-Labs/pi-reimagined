@@ -1,0 +1,29 @@
+{
+  "name": "pi-reimagined",
+  "version": "0.1.0",
+  "description": "A reimagined TUI for the pi coding agent: rounded input box, glowing working text, sparkle spinner, inline thinking box, a custom PI startup header, and switchable palettes (ember / void / ocean / forest).",
+  "type": "module",
+  "main": "pi-reimagined.ts",
+  "files": [
+    "pi-reimagined.ts",
+    "themes"
+  ],
+  "keywords": [
+    "pi",
+    "pi-agent",
+    "coding-agent",
+    "tui",
+    "extension",
+    "theme"
+  ],
+  "author": "radu0120",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Radu0120/pi-reimagined.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Radu0120/pi-reimagined/issues"
+  },
+  "homepage": "https://github.com/Radu0120/pi-reimagined#readme"
+}
