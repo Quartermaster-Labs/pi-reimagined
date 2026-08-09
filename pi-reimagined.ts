@@ -426,9 +426,12 @@ class EmberEditor extends CustomEditor {
 // Cached border data (git branch, cache hits, diff stats) — updated periodically
 let borderCache = { branch: "", cacheHits: 0, diffAdded: 0, diffRemoved: 0 };
 let borderCacheTimer: NodeJS.Timeout | null = null;
+let borderCtx: any = undefined; // active ctx for border cache updates
 
-// Update cached border data
-function updateBorderCache(ctx: any): void {
+// Update cached border data (uses borderCtx, not captured ctx)
+function updateBorderCache(): void {
+  const ctx = borderCtx;
+  if (!ctx) return;
   const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
   try {
     const { execSync } = require("child_process");
@@ -460,9 +463,9 @@ function updateBorderCache(ctx: any): void {
   } catch {
     /* non-git dir, ignore */
   }
-  // Cache hits from message history
+  // Cache hits from message history (use ctx, not borderCtx — already captured above)
   try {
-    const branch = ctx.sessionManager?.getBranch?.();
+    const branch = borderCtx?.sessionManager?.getBranch?.();
     if (branch) {
       let cacheRead = 0;
       for (const entry of branch) {
@@ -480,10 +483,11 @@ function makeEditor(ctx: any) {
   return (tui: any, theme: any, keybindings: any) => {
     const ed = new EmberEditor(tui, theme, keybindings);
     (ed as any)._ctx = ctx;
+    borderCtx = ctx; // track active ctx for border cache updates
     // Start periodic cache updates
     if (!borderCacheTimer) {
-      updateBorderCache(ctx);
-      borderCacheTimer = setInterval(() => updateBorderCache(ctx), 3000);
+      updateBorderCache();
+      borderCacheTimer = setInterval(updateBorderCache, 3000);
     }
     ed.getInfo = () => {
       const u = ctx.getContextUsage?.();
@@ -1152,6 +1156,7 @@ export default function (pi: ExtensionAPI) {
   // Restore normal screen buffer on exit.
   pi.on("session_end", () => {
     footerContainerRef = undefined;
+    borderCtx = undefined;
     if (borderCacheTimer) { clearInterval(borderCacheTimer); borderCacheTimer = null; }
     process.stdout.write("\x1b[?1049l\x1b[2J\x1b[3J\x1b[H");
   });
