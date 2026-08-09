@@ -19,6 +19,9 @@ interface BorderStatus {
   percentage: boolean; // 54%
   path: boolean; // E:\Apps\LLM\pi-reimagined
   model: boolean; // model-id
+  branch: boolean; // git branch (right of path)
+  cacheHits: boolean; // cache hits (right of percentage)
+  diffStats: boolean; // lines added/removed from git diff
 }
 interface Cfg {
   roundedBox: boolean;
@@ -30,7 +33,7 @@ interface Cfg {
   customHeader: boolean;
   palette: string;
 }
-const borderDefault: BorderStatus = { progress: true, percentage: true, path: true, model: true };
+const borderDefault: BorderStatus = { progress: true, percentage: true, path: true, model: true, branch: false, cacheHits: false, diffStats: false };
 function bsOn(key: keyof BorderStatus): boolean {
   if (cfg.borderStatus === true) return true;
   return (cfg.borderStatus as Partial<BorderStatus>)?.[key] ?? borderDefault[key];
@@ -371,17 +374,30 @@ class EmberEditor extends CustomEditor {
         topLen = VW(topLabel);
       }
 
-      // Bottom label: progress bar + percentage + path (each optional)
+      // Bottom label: progress bar + percentage + path + branch + cacheHits + diffStats (each optional)
       const parts: string[] = [];
       if (bsOn("progress") || bsOn("percentage")) {
         const bar = ctxBar(info.percent);
         const [r, g, b] = barRgb(info.percent);
         parts.push(tc(r, g, b, bar.text));
       }
+      if (bsOn("cacheHits") && info.cacheHits > 0) {
+        const fmt = info.cacheHits >= 1_000_000 ? `${(info.cacheHits / 1_000_000).toFixed(1)}M` : info.cacheHits >= 1_000 ? `${Math.round(info.cacheHits / 1000)}k` : `${info.cacheHits}`;
+        parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], `cache: ${fmt}`));
+      }
       if (bsOn("path")) {
         const DIR_MAX = 48;
         const dir = this.fitTail(info.dir, Math.min(DIR_MAX, Math.max(0, budget - parts.reduce((s, p) => s + VW(p), 0))));
         if (dir.length >= 1) parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], dir));
+      }
+      if (bsOn("branch") && info.branch) {
+        parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], `(${info.branch})`));
+      }
+      if (bsOn("diffStats") && (info.diffAdded > 0 || info.diffRemoved > 0)) {
+        const added = info.diffAdded > 0 ? tc(0, 180, 80, `+${info.diffAdded}`) : "";
+        const removed = info.diffRemoved > 0 ? tc(180, 0, 0, `-${info.diffRemoved}`) : "";
+        const sep = added && removed ? " " : "";
+        parts.push(added + sep + removed);
       }
       if (parts.length) {
         botLabel = parts.join(paint(" ") + paint("─".repeat(2)) + paint(" "));
@@ -407,11 +423,68 @@ class EmberEditor extends CustomEditor {
   }
 }
 
+// Cached border data (git branch, cache hits, diff stats) — updated periodically
+let borderCache = { branch: "", cacheHits: 0, diffAdded: 0, diffRemoved: 0 };
+let borderCacheTimer: NodeJS.Timeout | null = null;
+
+// Update cached border data
+function updateBorderCache(ctx: any): void {
+  const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
+  try {
+    const { execSync } = require("child_process");
+    // Git branch
+    try {
+      borderCache.branch = execSync("git branch --show-current", { cwd, encoding: "utf8" }).trim() || "";
+    } catch {
+      borderCache.branch = "";
+    }
+    // Diff stats (staged + unstaged)
+    try {
+      const diff = execSync("git diff --numstat", { cwd, encoding: "utf8" }).trim();
+      let added = 0, removed = 0;
+      if (diff) {
+        for (const line of diff.split("\n")) {
+          const [a, r] = line.split("\t");
+          if (a !== "-" && r !== "-") {
+            added += parseInt(a, 10) || 0;
+            removed += parseInt(r, 10) || 0;
+          }
+        }
+      }
+      borderCache.diffAdded = added;
+      borderCache.diffRemoved = removed;
+    } catch {
+      borderCache.diffAdded = 0;
+      borderCache.diffRemoved = 0;
+    }
+  } catch {
+    /* non-git dir, ignore */
+  }
+  // Cache hits from message history
+  try {
+    const branch = ctx.sessionManager?.getBranch?.();
+    if (branch) {
+      let cacheRead = 0;
+      for (const entry of branch) {
+        if (entry.usage?.cacheRead) cacheRead += entry.usage.cacheRead;
+      }
+      borderCache.cacheHits = cacheRead;
+    }
+  } catch {
+    borderCache.cacheHits = 0;
+  }
+}
+
 // Editor factory bound to a ctx, feeding the box live model / context% / cwd.
 function makeEditor(ctx: any) {
   return (tui: any, theme: any, keybindings: any) => {
     const ed = new EmberEditor(tui, theme, keybindings);
     (ed as any)._ctx = ctx;
+    // Start periodic cache updates
+    if (!borderCacheTimer) {
+      updateBorderCache(ctx);
+      borderCacheTimer = setInterval(() => updateBorderCache(ctx), 3000);
+    }
     ed.getInfo = () => {
       const u = ctx.getContextUsage?.();
       const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
@@ -420,6 +493,10 @@ function makeEditor(ctx: any) {
         percent: u && u.percent != null ? u.percent : 0,
         contextWindow: u?.contextWindow ?? 0,
         dir: homeRel(cwd),
+        branch: borderCache.branch,
+        cacheHits: borderCache.cacheHits,
+        diffAdded: borderCache.diffAdded,
+        diffRemoved: borderCache.diffRemoved,
       };
     };
     return ed;
@@ -1072,6 +1149,7 @@ export default function (pi: ExtensionAPI) {
   // Restore normal screen buffer on exit.
   pi.on("session_end", () => {
     footerContainerRef = undefined;
+    if (borderCacheTimer) { clearInterval(borderCacheTimer); borderCacheTimer = null; }
     process.stdout.write("\x1b[?1049l\x1b[2J\x1b[3J\x1b[H");
   });
 
@@ -1118,7 +1196,10 @@ export default function (pi: ExtensionAPI) {
           `${bs.model ? "[x]" : "[ ]"} Model name          (top)`,
           `${bs.progress ? "[x]" : "[ ]"} Progress bar        (bottom)`,
           `${bs.percentage ? "[x]" : "[ ]"} Percentage          (bottom)`,
+          `${bs.cacheHits ? "[x]" : "[ ]"} Cache hits          (bottom)`,
           `${bs.path ? "[x]" : "[ ]"} Path                (bottom)`,
+          `${bs.branch ? "[x]" : "[ ]"} Git branch          (bottom)`,
+          `${bs.diffStats ? "[x]" : "[ ]"} Diff stats          (bottom)`,
           "Close",
         ];
         const choice = await ctx.ui.select("Status bar elements", opts);
@@ -1126,7 +1207,10 @@ export default function (pi: ExtensionAPI) {
         if (choice.includes("Model")) bs.model = !bs.model;
         else if (choice.includes("Progress")) bs.progress = !bs.progress;
         else if (choice.includes("Percentage")) bs.percentage = !bs.percentage;
+        else if (choice.includes("Cache")) bs.cacheHits = !bs.cacheHits;
         else if (choice.includes("Path")) bs.path = !bs.path;
+        else if (choice.includes("Git")) bs.branch = !bs.branch;
+        else if (choice.includes("Diff")) bs.diffStats = !bs.diffStats;
         else break;
         saveCfg();
         applyEditor(ctx);
