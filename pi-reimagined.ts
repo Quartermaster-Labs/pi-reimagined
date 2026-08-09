@@ -969,7 +969,6 @@ async function pickPalette(ctx: any): Promise<void> {
 const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void }[] = [
   { name: "Rounded input box", get: () => cfg.roundedBox, set: (v) => (cfg.roundedBox = v) },
   { name: "❯ prompt char", get: () => cfg.promptChar, set: (v) => (cfg.promptChar = v) },
-  { name: "Status in border", get: () => cfg.borderStatus, set: (v) => (cfg.borderStatus = v) },
   { name: "Glowing working text", get: () => cfg.glowText, set: (v) => (cfg.glowText = v) },
   { name: "Sparkle spinner", get: () => cfg.sparkleSpinner, set: (v) => (cfg.sparkleSpinner = v) },
   { name: "Live thinking box", get: () => cfg.thinkBox, set: (v) => (cfg.thinkBox = v) },
@@ -1082,6 +1081,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args: string, ctx: any) => {
       if (ctx.mode !== "tui") return;
       const PALETTE_ROW = "Palette ▸";
+      const STATUS_ROW = "Status ▸";
       for (;;) {
         const opts = TOGGLES.map((t) => `${t.get() ? "[x]" : "[ ]"} ${t.name}`);
         opts.push(`${PALETTE_ROW} ${cfg.palette}`);
@@ -1099,6 +1099,38 @@ export default function (pi: ExtensionAPI) {
         applyEditor(ctx); // refresh box / prompt / status live
         applyHeader(ctx); // refresh header on toggle
         ctx.ui.notify(`${t.name}: ${t.get() ? "on" : "off"}`);
+      }
+    },
+  });
+
+  // /status-bar — configure border status elements
+  pi.registerCommand("status-bar", {
+    description: "Toggle border status elements (progress, percentage, path, model)",
+    handler: async (_args: string, ctx: any) => {
+      if (ctx.mode !== "tui") return;
+      // Ensure borderStatus is an object (upgrade from legacy true)
+      if (cfg.borderStatus === true) {
+        cfg.borderStatus = { ...borderDefault };
+      }
+      const bs = cfg.borderStatus as Partial<BorderStatus>;
+      for (;;) {
+        const opts = [
+          `${bs.progress ? "[x]" : "[ ]"} Progress bar`,
+          `${bs.percentage ? "[x]" : "[ ]"} Percentage`,
+          `${bs.path ? "[x]" : "[ ]"} Path`,
+          `${bs.model ? "[x]" : "[ ]"} Model name`,
+          "Close",
+        ];
+        const choice = await ctx.ui.select("Status bar elements", opts);
+        if (!choice || choice === "Close") break;
+        if (choice.includes("Progress")) bs.progress = !bs.progress;
+        else if (choice.includes("Percentage")) bs.percentage = !bs.percentage;
+        else if (choice.includes("Path")) bs.path = !bs.path;
+        else if (choice.includes("Model")) bs.model = !bs.model;
+        else break;
+        saveCfg();
+        applyEditor(ctx);
+        ctx.ui.notify(`${choice.replace(/\[.\] /, "")}: ${!!(bs.progress ?? bs.percentage ?? bs.path ?? bs.model) ? "on" : "off"}`);
       }
     },
   });
