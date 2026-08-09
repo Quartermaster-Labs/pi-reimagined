@@ -13,13 +13,19 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 
 ## Architecture
 
+- **Fullscreen mode.** `captureInteractiveMode()` patches `InteractiveMode.prototype.renderWidgets`
+  to capture the singleton instance. `session_start` calls `switchTuiMode("fullscreen")`
+  to activate pi's native `TuiAltScreen` — built-in ScrollView with `follow: "end"` (auto-
+  scroll to bottom, releases for manual scroll), proper mouse handling, cursor positioning,
+  and differential rendering. No manual `\x1b[?1049h` or doRender patches.
 - **Palette system.** `PALETTES` map (ember/void/ocean/forest). Each entry = brand
   RGB (`base`, `crest`, `prompt`) the theme JSON can't express + glyphs (`promptChar`,
   `star`, `spinner`) + the name of a paired theme JSON. `applyPalette()` rebuilds the
   derived ANSI (`BASE_PRE`, `SPIN`, `PROMPT`, `STAR`) into module-level `let`s. Switching
   a palette drives both the brand RGB and `ctx.ui.setTheme(P.theme)`.
 - **Rounded input box** — `EmberEditor extends CustomEditor`, decorates rendered rows
-  (corners, side `│`, prompt `❯`, status baked into border).
+  (corners, side `│`, prompt `❯`, status baked into border). Scrolling handled by
+  TuiAltScreen's ScrollView, not manual scrollOffset.
 - **Custom header** — `ctx.ui.setHeader(factory)`; `PI` block letters with a vertical
   palette gradient, host info on the right, palette divider.
 - **Inline thinking box** — monkeypatches `AssistantMessageComponent.prototype.updateContent`
@@ -49,8 +55,10 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
   meant to be palette-tinted; use `accent`.
 - pi-tui's `TUI.render` scrolls the real terminal buffer (`tui.js`: pushes `\r\n`, tracks
   `viewportTop`) — scrolling to prior messages is native terminal scrollback, not an
-  app-managed viewport. Never enter the alternate screen buffer (`\x1b[?1049h`); alt-screen
-  keeps no scrollback in virtually any terminal, so it silently breaks scroll-to-history.
+  app-managed viewport. **Never manually enter alt-screen** (`\x1b[?1049h`) — use pi's
+  `InteractiveMode.switchTuiMode("fullscreen")` which activates `TuiAltScreen` with
+  proper ScrollView management. Manual alt-screen breaks scrollback and conflicts with
+  pi's internal renderer lifecycle.
 
 ## Conventions
 

@@ -255,6 +255,10 @@ interface BoxInfo {
   percent: number;
   contextWindow: number;
   dir: string;
+  branch?: string;
+  cacheHits?: number;
+  diffAdded?: number;
+  diffRemoved?: number;
 }
 
 const CTRLC_EXIT_MS = 500; // double-press window; warning label lives exactly this long
@@ -291,25 +295,6 @@ class EmberEditor extends CustomEditor {
         (this as any)._lastCtrlC = now;
       }
       return; // don't pass to super
-    }
-    // PgUp/PgDn: scroll virtual buffer when editor is empty.
-    if (this.getText().length === 0) {
-      const isPgUp = this.keybindings?.matches(data, "app.message.cycle");
-      const isPgDn = this.keybindings?.matches(data, "app.message.next");
-      if (isPgUp || isPgDn) {
-        const page = Math.floor((process.stdout.rows || 24) / 2);
-        if (isPgUp) {
-          scrollOffset = Math.max(-999999, scrollOffset - page);
-        } else if (scrollOffset < 0) {
-          scrollOffset = Math.min(0, scrollOffset + page);
-        }
-        (this as any).tui?.requestRender();
-        return;
-      }
-    }
-    // Reset scroll to bottom on first char typed
-    if (this.getText().length === 0 && scrollOffset < 0 && data.length === 1 && !data.startsWith("\x1b")) {
-      scrollOffset = 0;
     }
     super.handleInput(data);
   }
@@ -735,74 +720,32 @@ function rebuildLiveMessages(): void {
   }
 }
 
-// Virtual scroll system for alt-screen mode.
-// In alt-screen, terminal has no scrollback. We keep full content in memory
-// and render only a viewport slice (height lines) to the terminal.
-let scrollOffset = 0; // 0 = show bottom, negative = scroll up N lines from bottom
-let _viewportPatched = false;
-
-// Parse ANSI buffer into array of lines (preserves escape sequences).
-function parseBufferLines(data: string): string[] {
-  // Split on \r\n but keep ANSI escapes intact
-  return data.split("\r\n");
-}
-
-function initViewportScroll(): void {
-  if (_viewportPatched) return;
-  _viewportPatched = true;
+// InteractiveMode singleton capture. We patch renderWidgets on the prototype
+// so the very first call (during InteractiveMode.init()) stores the instance.
+// This lets us call switchTuiMode("fullscreen") from the extension's session_start
+// handler, using pi's native TuiAltScreen instead of manual alt-screen escapes.
+let interactiveModeInstance: any = undefined;
+let _immCaptured = false;
+function captureInteractiveMode(): void {
+  if (_immCaptured) return;
+  _immCaptured = true;
   loadHost().then(({ tui }) => {
-    try {
-      // Full doRender replacement: render → slice viewport → write directly.
-      tui.TUI.prototype.doRender = function (this: any) {
-        if (this.stopped) return;
-        const width = this.terminal.columns;
-        const height = this.terminal.rows;
-
-        // Render full content + overlays
-        let newLines = this.render(width);
-        if (this.overlayStack.length > 0) {
-          newLines = this.compositeOverlays(newLines, width, height);
-        }
-        newLines = this.applyLineResets(newLines);
-
-        // Viewport slice
-        const total = newLines.length;
-        const excess = Math.max(0, total - height);
-        const clampedScroll = Math.min(0, Math.max(-excess, scrollOffset));
-        const viewTop = excess > 0 ? Math.max(0, total - height + clampedScroll) : 0;
-        let viewLines = newLines.slice(viewTop, Math.min(total, viewTop + height));
-        while (viewLines.length < height) viewLines.push("");
-        appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `V: total=${total} excess=${excess} rawScroll=${scrollOffset} clamped=${clampedScroll} top=${viewTop} viewLen=${viewLines.length}\n`);
-
-        // Write directly to stdout (bypass ProcessTerminal)
-        appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `Writing ${viewLines.length} lines\n`);
-        let buf = "\x1b[?25l\x1b[H"; // hide cursor, home
-        for (let i = 0; i < viewLines.length; i++) {
-          if (i > 0) buf += "\r\n";
-          buf += "\x1b[2K"; // erase line
-          buf += viewLines[i];
-        }
-        buf += "\x1b[?25h"; // show cursor
-        try {
-          process.stdout.write(buf);
-          appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `Wrote OK, bufLen=${buf.length}\n`);
-        } catch (e) {
-          appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `Write ERROR: ${(e as Error).message}\n`);
-        }
-
-        // Update TUI internal state
-        this.previousLines = newLines;
-        this.previousWidth = width;
-        this.previousHeight = height;
-        this.maxLinesRendered = Math.max(this.maxLinesRendered, total);
+    const imMod: any = tui;
+    // interactive-mode.js is not exported from pi-tui; deep-import it
+    const { pathToFileURL } = require("node:url");
+    const pkg = join(
+      process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
+      "npm", "node_modules", "@earendil-works", "pi-coding-agent",
+    );
+    const url = (p: string) => pathToFileURL(join(pkg, p)).href;
+    import(url("dist/modes/interactive/interactive-mode.js")).then((im: any) => {
+      const origRenderWidgets = im.InteractiveMode.prototype.renderWidgets;
+      im.InteractiveMode.prototype.renderWidgets = function (...args: any[]) {
+        if (!interactiveModeInstance) interactiveModeInstance = this;
+        return origRenderWidgets.apply(this, args);
       };
-      appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), "Viewport patch installed OK\n");
-    } catch (e) {
-      appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), "ERROR: " + (e as Error).message + "\n");
-    }
-  }).catch((e) => {
-    appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), "loadHost ERROR: " + (e as Error).message + "\n");
-  });
+    }).catch(() => { /* deep import failed — non-fatal */ });
+  }).catch(() => {});
 }
 
 // Memoized deep-import of the host's internals. The package `exports` map only
@@ -1067,21 +1010,24 @@ const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void }[]
 export default function (pi: ExtensionAPI) {
   loadCfg();
   applyPalette();
+  captureInteractiveMode(); // patch InteractiveMode.prototype.renderWidgets before instance is created
 
   pi.on("session_start", (_e, ctx) => {
     if (ctx.mode !== "tui") return;
     // Capture footer container for allocateStackSizes patch (collapse to 0 when roundedBox).
     footerContainerRef = ctx.footerContainer;
-    // Enter alternate screen buffer — full viewport control, no native scrollback.
-    // Clear entire display, clear scrollback, home cursor.
-    process.stdout.write("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H");
+    // Switch to pi's native fullscreen mode (TuiAltScreen) — replaces our manual
+    // \x1b[?1049h / doRender patch with the built-in ScrollView, proper mouse
+    // handling, cursor positioning, and differential rendering.
+    if (interactiveModeInstance) {
+      interactiveModeInstance.switchTuiMode("fullscreen");
+    }
     ctx.ui.setTheme?.(P.theme); // pair the pi theme to the active palette
     applyEditor(ctx);
     applyHeader(ctx); // swap pi's logo/hints for the PI banner
     // Defer async ops (loadHost imports, patching) to next tick so pi's initial
     // prompt renders faster — the dynamic imports are the biggest delay source.
     setTimeout(() => {
-      initViewportScroll(); // virtual scroll for alt-screen
       patchThinking().catch((e) => {
         console.error("patchThinking failed:", e);
         appendFileSync(join(homedir(), ".pi/agent/logs/patch.log"), "patchThinking ERROR: " + (e as Error).message + "\n");
@@ -1161,12 +1107,10 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWorkingIndicator(); // restore default spinner
   });
 
-  // Restore normal screen buffer on exit.
-  pi.on("session_end", () => {
+  pi.on("session_shutdown", () => {
     footerContainerRef = undefined;
     borderCtx = undefined;
     if (borderCacheTimer) { clearInterval(borderCacheTimer); borderCacheTimer = null; }
-    process.stdout.write("\x1b[?1049l\x1b[2J\x1b[3J\x1b[H");
   });
 
   // /pi-reimagined — toggle features. Loops until the user closes the menu.
