@@ -14,15 +14,26 @@ const CFG_PATH = join(
   "agent",
   "pi-reimagined.config.json",
 );
+interface BorderStatus {
+  progress: boolean; // [#######------] visual bar
+  percentage: boolean; // 54%
+  path: boolean; // E:\Apps\LLM\pi-reimagined
+  model: boolean; // model-id
+}
 interface Cfg {
   roundedBox: boolean;
   promptChar: boolean;
-  borderStatus: boolean;
+  borderStatus: boolean | Partial<BorderStatus>; // true = all, object = per-element
   glowText: boolean;
   sparkleSpinner: boolean;
   thinkBox: boolean;
   customHeader: boolean;
   palette: string;
+}
+const borderDefault: BorderStatus = { progress: true, percentage: true, path: true, model: true };
+function bsOn(key: keyof BorderStatus): boolean {
+  if (cfg.borderStatus === true) return true;
+  return (cfg.borderStatus as Partial<BorderStatus>)?.[key] ?? borderDefault[key];
 }
 const cfg: Cfg = {
   roundedBox: true,
@@ -352,20 +363,28 @@ class EmberEditor extends CustomEditor {
     const budget = Math.max(0, width - 2) - 2 /*SAFE*/ - 2 /*PAD*/;
     let topLabel = "", topLen = 0, botLabel = "", botLen = 0;
     if (info) {
-      const starRoom = VW(" " + STAR); // STAR is east-asian-ambiguous-width; measure, don't assume 1
-      const model = this.fitTail(info.model, Math.max(0, budget - starRoom));
-      topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
-      topLen = VW(topLabel);
+      // Top label: model (optional)
+      if (bsOn("model")) {
+        const starRoom = VW(" " + STAR);
+        const model = this.fitTail(info.model, Math.max(0, budget - starRoom));
+        topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
+        topLen = VW(topLabel);
+      }
 
-      const bar = ctxBar(info.percent); // percentage-only for compact border
-      const GAP = 4; // breathing room between bar and dir
-      const DIR_MAX = 48; // hard cap; left-truncate so the last dir stays visible
-      const fixed = VW(bar.text) + GAP;
-      const dir = this.fitTail(info.dir, Math.min(DIR_MAX, Math.max(0, budget - fixed)));
-      if (dir.length >= 1) {
+      // Bottom label: progress bar + percentage + path (each optional)
+      const parts: string[] = [];
+      if (bsOn("progress") || bsOn("percentage")) {
+        const bar = ctxBar(info.percent);
         const [r, g, b] = barRgb(info.percent);
-        botLabel =
-          tc(r, g, b, bar.text) + paint(" " + "─".repeat(GAP - 2) + " ") + tc(DIR_C[0], DIR_C[1], DIR_C[2], dir);
+        parts.push(tc(r, g, b, bar.text));
+      }
+      if (bsOn("path")) {
+        const DIR_MAX = 48;
+        const dir = this.fitTail(info.dir, Math.min(DIR_MAX, Math.max(0, budget - parts.reduce((s, p) => s + VW(p), 0))));
+        if (dir.length >= 1) parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], dir));
+      }
+      if (parts.length) {
+        botLabel = parts.join(paint(" ") + paint("─".repeat(2)) + paint(" "));
         botLen = VW(botLabel);
       }
     }
@@ -991,14 +1010,19 @@ export default function (pi: ExtensionAPI) {
         const model = ctx.model?.id || "no-model";
         const branch = footerData.getGitBranch?.();
         const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
-        const left = homeRel(cwd) + (branch ? ` (${branch})` : "");
-        const right = `${bar.text}  ${model}`;
-        const gap = Math.max(2, width - left.length - right.length - 4);
+
+        const parts: string[] = [];
+        if (bsOn("path")) parts.push(homeRel(cwd) + (branch ? ` (${branch})` : ""));
+        if (bsOn("progress") || bsOn("percentage")) parts.push(bar.text);
+        if (bsOn("model")) parts.push(model);
+        if (parts.length === 0) return [];
+
+        const left = parts[0];
+        const right = parts.slice(1).join("  ");
+        const gap = right ? Math.max(2, width - left.length - right.length - 4) : 0;
         return [
           theme.fg("dim", left) +
-            " ".repeat(gap) +
-            theme.fg(bar.color, bar.text) +
-            theme.fg("dim", `  ${model} `) +
+            (right ? " ".repeat(gap) + theme.fg(bar.color, right) : "") +
             theme.fg("accent", "✷") +
             " ",
         ];
