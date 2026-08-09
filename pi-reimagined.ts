@@ -810,6 +810,7 @@ function initViewportScroll(): void {
 // thinking patch and the palette picker (both need pi-tui + the theme proxy).
 let host: { tui: any; T: any; themeMod: any; stackMod: any } | undefined;
 let footerContainerRef: any = undefined; // captured from ctx during session_start
+let stackPatched = false;
 async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: any }> {
   if (host) return host;
   const { pathToFileURL } = await import("node:url");
@@ -825,25 +826,32 @@ async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: 
   TTW = tui.truncateToWidth;
   host = { tui, T: themeMod.theme, themeMod, stackMod };
 
-  // Patch allocateStackSizes: when roundedBox is on and footer renders 0 lines,
+  // Patch allocateStackSizes once: when roundedBox is on and footer renders 0 lines,
   // override minSize for the footerContainer entry so it collapses to 0 instead
   // of the host's minSize: 1 (which leaves a blank line).
-  const origAllocate = stackMod.allocateStackSizes;
-  stackMod.allocateStackSizes = function (...args: any[]) {
-    const [entries, intrinsicSizes] = args as [any[], number[]];
-    if (cfg.roundedBox && footerContainerRef) {
-      for (const entry of entries) {
-        if (entry.component === footerContainerRef) {
-          const prev = entry.minSize;
-          entry.minSize = 0;
-          const result = origAllocate(...args);
-          entry.minSize = prev;
-          return result;
+  if (!stackPatched) {
+    stackPatched = true;
+    try {
+      const origAllocate = stackMod.allocateStackSizes;
+      stackMod.allocateStackSizes = function (...args: any[]) {
+        const [entries, intrinsicSizes] = args as [any[], number[]];
+        if (cfg.roundedBox && footerContainerRef) {
+          for (const entry of entries) {
+            if (entry.component === footerContainerRef) {
+              const prev = entry.minSize;
+              entry.minSize = 0;
+              const result = origAllocate(...args);
+              entry.minSize = prev;
+              return result;
+            }
+          }
         }
-      }
+        return origAllocate(...args);
+      };
+    } catch {
+      /* already patched or non-configurable — ignore */
     }
-    return origAllocate(...args);
-  };
+  }
 
   return host;
 }
