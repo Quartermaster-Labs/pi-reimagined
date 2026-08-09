@@ -30,6 +30,7 @@ interface Cfg {
   glowText: boolean;
   sparkleSpinner: boolean;
   thinkBox: boolean;
+  collapseThinking: boolean;
   customHeader: boolean;
   palette: string;
 }
@@ -45,6 +46,7 @@ const cfg: Cfg = {
   glowText: true,
   sparkleSpinner: true,
   thinkBox: true,
+  collapseThinking: false,
   customHeader: true,
   palette: "ember",
 };
@@ -849,7 +851,7 @@ async function patchThinking(): Promise<void> {
         this.contentContainer.addChild(new Markdown(content.text.trim(), 1, 0, this.markdownTheme));
       } else if (content.type === "thinking" && content.thinking.trim()) {
         const after = message.content.slice(i + 1).some(visible);
-        if (this.hideThinkingBlock) {
+        if (this.hideThinkingBlock || cfg.collapseThinking) {
           this.contentContainer.addChild(
             new Text(T.italic(T.fg("thinkingText", this.hiddenThinkingLabel)), 1, 0),
           );
@@ -998,12 +1000,13 @@ async function pickPalette(ctx: any): Promise<void> {
 }
 
 // Toggle table drives both the menu and persistence.
-const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void }[] = [
+const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void; apply?: (ctx: any) => void }[] = [
   { name: "Rounded input box", get: () => cfg.roundedBox, set: (v) => (cfg.roundedBox = v) },
   { name: "❯ prompt char", get: () => cfg.promptChar, set: (v) => (cfg.promptChar = v) },
   { name: "Glowing working text", get: () => cfg.glowText, set: (v) => (cfg.glowText = v) },
   { name: "Sparkle spinner", get: () => cfg.sparkleSpinner, set: (v) => (cfg.sparkleSpinner = v) },
   { name: "Live thinking box", get: () => cfg.thinkBox, set: (v) => (cfg.thinkBox = v) },
+  { name: "Collapse thinking", get: () => cfg.collapseThinking, set: (v) => (cfg.collapseThinking = v), apply: (ctx: any) => rebuildLiveMessages() },
   { name: "Custom header", get: () => cfg.customHeader, set: (v) => (cfg.customHeader = v) },
 ];
 
@@ -1021,6 +1024,12 @@ export default function (pi: ExtensionAPI) {
     // handling, cursor positioning, and differential rendering.
     if (interactiveModeInstance) {
       interactiveModeInstance.switchTuiMode("fullscreen");
+      // Recolor scrollbar with palette base instead of theme.bg("scrollbarThumb") (muted).
+      interactiveModeInstance.settingsManager?.setFullscreenScrollbar("auto");
+      interactiveModeInstance.transcriptScrollView.scrollbarStyle = (text: string) =>
+        `\x1b[48;2;${P.base[0]};${P.base[1]};${P.base[2]}m${text}\x1b[49m`;
+      // Boost scroll sensitivity (default = 1 line per wheel tick)
+      (interactiveModeInstance.renderer as any).wheelScrollLines = 3;
     }
     ctx.ui.setTheme?.(P.theme); // pair the pi theme to the active palette
     applyEditor(ctx);
@@ -1136,6 +1145,7 @@ export default function (pi: ExtensionAPI) {
         saveCfg();
         applyEditor(ctx); // refresh box / prompt / status live
         applyHeader(ctx); // refresh header on toggle
+        t.apply?.(ctx); // per-toggle side effects (e.g. rebuild live messages)
         ctx.ui.notify(`${t.name}: ${t.get() ? "on" : "off"}`);
       }
     },
