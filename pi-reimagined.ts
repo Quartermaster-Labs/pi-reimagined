@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { join, basename } from "node:path";
+import { homedir } from "node:os";
 
 // pi reimagined: rounded input box, glow working text, sparkle spinner, ember
 // thinking box, and switchable palettes (ember / void / ocean / forest).
@@ -123,12 +124,20 @@ function piVersion(): string {
 // Colors come from the active theme via theme.fg(), so this stays palette-agnostic.
 
 const BAR_W = 13;
-function ctxBar(percent: number): { text: string; color: string } {
+function formatCtxWindow(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(tokens / 1000)}k`;
+}
+function ctxBar(percent: number, contextWindow?: number, autoCompact?: boolean): { text: string; color: string } {
   const p = Math.max(0, Math.min(100, percent));
   const filled = Math.round((p / 100) * BAR_W);
-  const bar = `[${"#".repeat(filled)}${"-".repeat(BAR_W - filled)}] ${Math.round(p)}%`;
+  const bar = `[${"#".repeat(filled)}${"-".repeat(BAR_W - filled)}]`;
+  const autoLabel = autoCompact ? " (auto)" : "";
+  const pctLabel = contextWindow
+    ? `${p.toFixed(1)}%/${formatCtxWindow(contextWindow)}${autoLabel}`
+    : `${Math.round(p)}%${autoLabel}`;
   const color = p > 90 ? "error" : p > 70 ? "warning" : "dim";
-  return { text: bar, color };
+  return { text: `${bar} ${pctLabel}`, color };
 }
 
 function homeRel(cwd: string): string {
@@ -193,6 +202,11 @@ const RST = "\x1b[0m";
 let BASE_PRE = ""; // \x1b[38;2;r;g;bm for the palette base — set by applyPalette
 let SPIN: string[] = []; // colored spinner frames — set by applyPalette
 
+// header sweep animation state
+let sweepPhase = 0; // sweep column offset (global, read by makeHeader render)
+let sweepTimer: ReturnType<typeof setInterval> | undefined;
+let hdrComp: any; // captured header component ref for invalidate
+
 // Recompute palette + derived ANSI/glyphs. Cheap; safe to call on every change.
 function applyPalette(): void {
   P = PALETTES[cfg.palette] || PALETTES.ember;
@@ -225,14 +239,65 @@ const barRgb = (p: number): [number, number, number] =>
 interface BoxInfo {
   model: string;
   percent: number;
+  contextWindow: number;
   dir: string;
 }
 
+const CTRLC_EXIT_MS = 500; // double-press window; warning label lives exactly this long
+
 class EmberEditor extends CustomEditor {
   getInfo?: () => BoxInfo;
+  private ctrlCWarnUntil = 0; // Date.now() deadline; render() shows exit hint until then
 
   setPaddingX(p: number): void {
     super.setPaddingX(Math.max(2, p)); // col0 = ❯/│, col1 = space, text from col2
+  }
+
+  handleInput(data: string): void {
+    // Ctrl+C: if text → clear it. If empty → shutdown on double-press.
+    // Bypass CustomEditor's actionHandlers loop (it never fires app.clear).
+    if (this.keybindings?.matches(data, "app.clear")) {
+      const text = this.getText();
+      if (text.length > 0) {
+        this.setText("");
+        (this as any).tui?.requestRender();
+      }
+      else {
+        const now = Date.now();
+        if (now - ((this as any)._lastCtrlC || 0) < CTRLC_EXIT_MS) {
+          (this as any)._ctx.shutdown?.();
+        } else {
+          // first press: show "press again to exit" for the double-press window,
+          // then force one more render so the hint clears itself even if the
+          // user never touches the keyboard again.
+          this.ctrlCWarnUntil = now + CTRLC_EXIT_MS;
+          (this as any).tui?.requestRender();
+          setTimeout(() => (this as any).tui?.requestRender(), CTRLC_EXIT_MS);
+        }
+        (this as any)._lastCtrlC = now;
+      }
+      return; // don't pass to super
+    }
+    // PgUp/PgDn: scroll virtual buffer when editor is empty.
+    if (this.getText().length === 0) {
+      const isPgUp = this.keybindings?.matches(data, "app.message.cycle");
+      const isPgDn = this.keybindings?.matches(data, "app.message.next");
+      if (isPgUp || isPgDn) {
+        const page = Math.floor((process.stdout.rows || 24) / 2);
+        if (isPgUp) {
+          scrollOffset = Math.max(-999999, scrollOffset - page);
+        } else if (scrollOffset < 0) {
+          scrollOffset = Math.min(0, scrollOffset + page);
+        }
+        (this as any).tui?.requestRender();
+        return;
+      }
+    }
+    // Reset scroll to bottom on first char typed
+    if (this.getText().length === 0 && scrollOffset < 0 && data.length === 1 && !data.startsWith("\x1b")) {
+      scrollOffset = 0;
+    }
+    super.handleInput(data);
   }
 
   // Build a corner row with a right-aligned label baked into the ─ fill.
@@ -282,6 +347,7 @@ class EmberEditor extends CustomEditor {
     const promptI = topI + 1; // first text row sits right below the top border
 
     // Compose the two labels (width-aware so long model/dir truncate, not drop).
+    // Compose the two labels (width-aware so long model/dir truncate, not drop).
     const info = cfg.borderStatus ? this.getInfo?.() : undefined;
     const budget = Math.max(0, width - 2) - 2 /*SAFE*/ - 2 /*PAD*/;
     let topLabel = "", topLen = 0, botLabel = "", botLen = 0;
@@ -291,7 +357,7 @@ class EmberEditor extends CustomEditor {
       topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
       topLen = VW(topLabel);
 
-      const bar = ctxBar(info.percent);
+      const bar = ctxBar(info.percent); // percentage-only for compact border
       const GAP = 4; // breathing room between bar and dir
       const DIR_MAX = 48; // hard cap; left-truncate so the last dir stays visible
       const fixed = VW(bar.text) + GAP;
@@ -302,6 +368,12 @@ class EmberEditor extends CustomEditor {
           tc(r, g, b, bar.text) + paint(" " + "─".repeat(GAP - 2) + " ") + tc(DIR_C[0], DIR_C[1], DIR_C[2], dir);
         botLen = VW(botLabel);
       }
+    }
+    if (Date.now() < this.ctrlCWarnUntil) {
+      const warn = "press ctrl+c again to exit";
+      const [r, g, b] = P.prompt;
+      botLabel = `\x1b[3m\x1b[38;2;${r};${g};${b}m${warn}${RST}`; // \x1b[3m = italic
+      botLen = VW(warn);
     }
 
     return lines.map((line, i) => {
@@ -320,12 +392,15 @@ class EmberEditor extends CustomEditor {
 function makeEditor(ctx: any) {
   return (tui: any, theme: any, keybindings: any) => {
     const ed = new EmberEditor(tui, theme, keybindings);
+    (ed as any)._ctx = ctx;
     ed.getInfo = () => {
       const u = ctx.getContextUsage?.();
+      const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
       return {
         model: ctx.model?.id || "no-model",
         percent: u && u.percent != null ? u.percent : 0,
-        dir: homeRel(ctx.cwd || ""),
+        contextWindow: u?.contextWindow ?? 0,
+        dir: homeRel(cwd),
       };
     };
     return ed;
@@ -354,6 +429,9 @@ const LOGO = [
 ];
 const LOGOW = 11; // visible width of every LOGO row
 const HDR_GAP = 3; // columns between logo and info
+const HDR_SWEEP_MS = 40; // sweep animation tick
+const HDR_SWEEP_ROWS = 3; // row half-width for vertical sweep
+const HDR_SWEEP_TICK = 0.4; // rows advanced per tick (slower traversal)
 
 // ponytail: hint text is hardcoded to pi's defaults; drifts if the user rebinds
 // keys. It's cosmetic — the real keybindings still work. Edit here if needed.
@@ -372,14 +450,28 @@ function makeHeader(ctx: any) {
     render(width: number): string[] {
       const rows = LOGO.length;
       // vertical gradient: bright crest at top -> ember base at bottom
-      const logo = LOGO.map((ln, i) => {
-        const t = rows > 1 ? i / (rows - 1) : 0;
-        return tc(
-          lerp(P.crest[0], P.base[0], t),
-          lerp(P.crest[1], P.base[1], t),
-          lerp(P.crest[2], P.base[2], t),
-          ln,
-        );
+      // overlay a horizontal sweep: a hot band traveling top→bottom,
+      // making each logo row glow left→right as the sweep column passes.
+      const logo = LOGO.map((ln, rowI) => {
+        let chars = "";
+        for (let colI = 0; colI < ln.length; colI++) {
+          if (ln[colI] !== "█") { chars += ln[colI]; continue; }
+          // vertical sweep: brightness based on row distance to sweep line
+          const dist = rowI - sweepPhase;
+          const t = Math.max(0, 1 - Math.abs(dist) / HDR_SWEEP_ROWS);
+          // vertical gradient base, brightened by sweep proximity
+          const vertT = rows > 1 ? rowI / (rows - 1) : 0;
+          const br = lerp(P.crest[0], P.base[0], vertT);
+          const bg = lerp(P.crest[1], P.base[1], vertT);
+          const bb = lerp(P.crest[2], P.base[2], vertT);
+          chars += tc(
+            lerp(br, 255, t),
+            lerp(bg, 255, t),
+            lerp(bb, 255, t),
+            ln[colI],
+          );
+        }
+        return chars;
       });
 
       // info lines keyed to logo rows (sparse: blanks where undefined)
@@ -398,11 +490,11 @@ function makeHeader(ctx: any) {
         out.push(logo[i] + " ".repeat(HDR_GAP) + right);
       }
 
-      // palette-colored divider (dimmed base) spanning the full width
+      // palette-colored divider
       const d: RGB = [
-        Math.round(P.base[0] * 0.6),
-        Math.round(P.base[1] * 0.6),
-        Math.round(P.base[2] * 0.6),
+        Math.round(P.base[0] * 0.5),
+        Math.round(P.base[1] * 0.5),
+        Math.round(P.base[2] * 0.5),
       ];
       out.push(tc(d[0], d[1], d[2], "─".repeat(Math.max(0, width))));
       return out;
@@ -410,8 +502,40 @@ function makeHeader(ctx: any) {
   });
 }
 
+function startHeaderSweep(ctx: any): void {
+  const factory = makeHeader(ctx);
+  // Start the crest fully off the top edge (row 0 must read as dark on frame 1)
+  // and run only until it clears the bottom edge -- no idle tail once it's gone.
+  const start = -HDR_SWEEP_ROWS;
+  const end = LOGO.length - 1 + HDR_SWEEP_ROWS;
+  const totalTicks = Math.ceil((end - start) / HDR_SWEEP_TICK) + 1;
+  sweepPhase = start;
+  if (sweepTimer) clearInterval(sweepTimer);
+  let ticks = 0;
+  sweepTimer = setInterval(() => {
+    sweepPhase += HDR_SWEEP_TICK;
+    try { ctx.ui.setHeader(factory); } catch { /* disposed */ }
+    if (++ticks >= totalTicks) {
+      clearInterval(sweepTimer);
+      sweepTimer = undefined;
+      sweepPhase = end + HDR_SWEEP_ROWS; // past threshold -> plain gradient, no crest residue
+      try { ctx.ui.setHeader(factory); } catch { /* disposed */ }
+    }
+  }, HDR_SWEEP_MS);
+  ctx.ui.setHeader(factory); // initial render
+}
+
+function stopHeaderSweep(): void {
+  if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = undefined; }
+}
+
 function applyHeader(ctx: any): void {
-  ctx.ui.setHeader?.(cfg.customHeader ? makeHeader(ctx) : undefined);
+  if (cfg.customHeader) {
+    startHeaderSweep(ctx);
+  } else {
+    ctx.ui.setHeader?.(undefined);
+    stopHeaderSweep();
+  }
 }
 
 // --- ember thinking box (inline) -------------------------------------------
@@ -511,11 +635,82 @@ function rebuildLiveMessages(): void {
   }
 }
 
+// Virtual scroll system for alt-screen mode.
+// In alt-screen, terminal has no scrollback. We keep full content in memory
+// and render only a viewport slice (height lines) to the terminal.
+let scrollOffset = 0; // 0 = show bottom, negative = scroll up N lines from bottom
+let _viewportPatched = false;
+
+// Parse ANSI buffer into array of lines (preserves escape sequences).
+function parseBufferLines(data: string): string[] {
+  // Split on \r\n but keep ANSI escapes intact
+  return data.split("\r\n");
+}
+
+function initViewportScroll(): void {
+  if (_viewportPatched) return;
+  _viewportPatched = true;
+  loadHost().then(({ tui }) => {
+    try {
+      // Full doRender replacement: render → slice viewport → write directly.
+      tui.TUI.prototype.doRender = function (this: any) {
+        if (this.stopped) return;
+        const width = this.terminal.columns;
+        const height = this.terminal.rows;
+
+        // Render full content + overlays
+        let newLines = this.render(width);
+        if (this.overlayStack.length > 0) {
+          newLines = this.compositeOverlays(newLines, width, height);
+        }
+        newLines = this.applyLineResets(newLines);
+
+        // Viewport slice
+        const total = newLines.length;
+        const excess = Math.max(0, total - height);
+        const clampedScroll = Math.min(0, Math.max(-excess, scrollOffset));
+        const viewTop = excess > 0 ? Math.max(0, total - height + clampedScroll) : 0;
+        let viewLines = newLines.slice(viewTop, Math.min(total, viewTop + height));
+        while (viewLines.length < height) viewLines.push("");
+        appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `V: total=${total} excess=${excess} rawScroll=${scrollOffset} clamped=${clampedScroll} top=${viewTop} viewLen=${viewLines.length}\n`);
+
+        // Write directly to stdout (bypass ProcessTerminal)
+        appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `Writing ${viewLines.length} lines\n`);
+        let buf = "\x1b[?25l\x1b[H"; // hide cursor, home
+        for (let i = 0; i < viewLines.length; i++) {
+          if (i > 0) buf += "\r\n";
+          buf += "\x1b[2K"; // erase line
+          buf += viewLines[i];
+        }
+        buf += "\x1b[?25h"; // show cursor
+        try {
+          process.stdout.write(buf);
+          appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `Wrote OK, bufLen=${buf.length}\n`);
+        } catch (e) {
+          appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), `Write ERROR: ${(e as Error).message}\n`);
+        }
+
+        // Update TUI internal state
+        this.previousLines = newLines;
+        this.previousWidth = width;
+        this.previousHeight = height;
+        this.maxLinesRendered = Math.max(this.maxLinesRendered, total);
+      };
+      appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), "Viewport patch installed OK\n");
+    } catch (e) {
+      appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), "ERROR: " + (e as Error).message + "\n");
+    }
+  }).catch((e) => {
+    appendFileSync(join(homedir(), ".pi/agent/logs/viewport.log"), "loadHost ERROR: " + (e as Error).message + "\n");
+  });
+}
+
 // Memoized deep-import of the host's internals. The package `exports` map only
 // exposes ".", so subpath imports must go by absolute file URL. Shared by the
 // thinking patch and the palette picker (both need pi-tui + the theme proxy).
-let host: { tui: any; T: any; themeMod: any } | undefined;
-async function loadHost(): Promise<{ tui: any; T: any; themeMod: any }> {
+let host: { tui: any; T: any; themeMod: any; stackMod: any } | undefined;
+let footerContainerRef: any = undefined; // captured from ctx during session_start
+async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: any }> {
   if (host) return host;
   const { pathToFileURL } = await import("node:url");
   const pkg = join(
@@ -524,10 +719,32 @@ async function loadHost(): Promise<{ tui: any; T: any; themeMod: any }> {
   );
   const url = (p: string) => pathToFileURL(join(pkg, p)).href;
   const tui: any = await import(url("node_modules/@earendil-works/pi-tui/dist/index.js"));
+  const stackMod: any = await import(url("node_modules/@earendil-works/pi-tui/dist/components/stack.js"));
   const themeMod: any = await import(url("dist/modes/interactive/theme/theme.js"));
   VW = tui.visibleWidth;
   TTW = tui.truncateToWidth;
-  host = { tui, T: themeMod.theme, themeMod };
+  host = { tui, T: themeMod.theme, themeMod, stackMod };
+
+  // Patch allocateStackSizes: when roundedBox is on and footer renders 0 lines,
+  // override minSize for the footerContainer entry so it collapses to 0 instead
+  // of the host's minSize: 1 (which leaves a blank line).
+  const origAllocate = stackMod.allocateStackSizes;
+  stackMod.allocateStackSizes = function (...args: any[]) {
+    const [entries, intrinsicSizes] = args as [any[], number[]];
+    if (cfg.roundedBox && footerContainerRef) {
+      for (const entry of entries) {
+        if (entry.component === footerContainerRef) {
+          const prev = entry.minSize;
+          entry.minSize = 0;
+          const result = origAllocate(...args);
+          entry.minSize = prev;
+          return result;
+        }
+      }
+    }
+    return origAllocate(...args);
+  };
+
   return host;
 }
 
@@ -654,6 +871,12 @@ async function patchNotifications(): Promise<void> {
     }
   }
 
+  // Hide the Context / Extensions / Themes startup info block.
+  // User can still see it via ctrl+o (different code path).
+  im.InteractiveMode.prototype.showLoadedResources = function (_options?: any) {
+    this.loadedResourcesContainer?.clear();
+  };
+
   im.InteractiveMode.prototype.showPackageUpdateNotification = function (packages: string[]) {
     // Host styles this box with "warning" (amber in every palette). Repaint the
     // title + borders with palette "accent" so it follows the active palette.
@@ -740,14 +963,24 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_e, ctx) => {
     if (ctx.mode !== "tui") return;
+    // Capture footer container for allocateStackSizes patch (collapse to 0 when roundedBox).
+    footerContainerRef = ctx.footerContainer;
+    // Enter alternate screen buffer — full viewport control, no native scrollback.
+    // Clear entire display, clear scrollback, home cursor.
+    process.stdout.write("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H");
     ctx.ui.setTheme?.(P.theme); // pair the pi theme to the active palette
     applyEditor(ctx);
     applyHeader(ctx); // swap pi's logo/hints for the PI banner
-    patchThinking().catch(() => {}); // ember-box the inline thinking trace
-    patchNotifications().catch(() => {}); // recolor package-update line on palette change
+    // Defer async ops (loadHost imports, patching) to next tick so pi's initial
+    // prompt renders faster — the dynamic imports are the biggest delay source.
+    setTimeout(() => {
+      initViewportScroll(); // virtual scroll for alt-screen
+      patchThinking().catch(() => {}); // ember-box the inline thinking trace
+      patchNotifications().catch(() => {}); // recolor package-update line on palette change
+    }, 0);
 
-    // Status lives in the box border. Fall back to a one-line footer only when
-    // the box is off but status is still wanted; otherwise hide the footer.
+    // Status lives in the box border. Footer is hidden when roundedBox is on
+    // (allocateStackSizes is patched to collapse footer to 0 lines).
     ctx.ui.setFooter((_tui: any, theme: any, footerData: any) => ({
       invalidate() {},
       dispose() {},
@@ -757,7 +990,8 @@ export default function (pi: ExtensionAPI) {
         const bar = ctxBar(u && u.percent != null ? u.percent : 0);
         const model = ctx.model?.id || "no-model";
         const branch = footerData.getGitBranch?.();
-        const left = homeRel(ctx.cwd || "") + (branch ? ` (${branch})` : "");
+        const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
+        const left = homeRel(cwd) + (branch ? ` (${branch})` : "");
         const right = `${bar.text}  ${model}`;
         const gap = Math.max(2, width - left.length - right.length - 4);
         return [
@@ -810,6 +1044,12 @@ export default function (pi: ExtensionAPI) {
     }
     ctx.ui.setWorkingMessage(); // restore default "Working..."
     ctx.ui.setWorkingIndicator(); // restore default spinner
+  });
+
+  // Restore normal screen buffer on exit.
+  pi.on("session_end", () => {
+    footerContainerRef = undefined;
+    process.stdout.write("\x1b[?1049l\x1b[2J\x1b[3J\x1b[H");
   });
 
   // /pi-reimagined — toggle features. Loops until the user closes the menu.

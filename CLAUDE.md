@@ -47,6 +47,10 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
   installed in `session_start` is in place before they fire.
 - `theme.fg("warning", …)` is amber in every shipped palette — don't use it for anything
   meant to be palette-tinted; use `accent`.
+- pi-tui's `TUI.render` scrolls the real terminal buffer (`tui.js`: pushes `\r\n`, tracks
+  `viewportTop`) — scrolling to prior messages is native terminal scrollback, not an
+  app-managed viewport. Never enter the alternate screen buffer (`\x1b[?1049h`); alt-screen
+  keeps no scrollback in virtually any terminal, so it silently breaks scroll-to-history.
 
 ## Conventions
 
