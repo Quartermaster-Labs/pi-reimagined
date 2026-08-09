@@ -35,7 +35,7 @@ interface Cfg {
 }
 const borderDefault: BorderStatus = { progress: true, percentage: true, path: true, model: true, branch: false, cacheHits: false, diffStats: false };
 function bsOn(key: keyof BorderStatus): boolean {
-  if (cfg.borderStatus === true) return true;
+  if (cfg.borderStatus === true) return borderDefault[key]; // legacy: use per-element defaults
   return (cfg.borderStatus as Partial<BorderStatus>)?.[key] ?? borderDefault[key];
 }
 const cfg: Cfg = {
@@ -850,7 +850,6 @@ async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: 
 let patched = false;
 async function patchThinking(): Promise<void> {
   if (patched) return;
-  patched = true;
   const { pathToFileURL } = await import("node:url");
   const pkg = join(
     process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
@@ -930,6 +929,7 @@ async function patchThinking(): Promise<void> {
       }
     }
   };
+  patched = true;
 }
 
 // Patch the package-update notification once. The host bakes its body text with
@@ -1070,7 +1070,10 @@ export default function (pi: ExtensionAPI) {
     // prompt renders faster — the dynamic imports are the biggest delay source.
     setTimeout(() => {
       initViewportScroll(); // virtual scroll for alt-screen
-      patchThinking().catch(() => {}); // ember-box the inline thinking trace
+      patchThinking().catch((e) => {
+        console.error("patchThinking failed:", e);
+        appendFileSync(join(homedir(), ".pi/agent/logs/patch.log"), "patchThinking ERROR: " + (e as Error).message + "\n");
+      }); // ember-box the inline thinking trace
       patchNotifications().catch(() => {}); // recolor package-update line on palette change
     }, 0);
 
