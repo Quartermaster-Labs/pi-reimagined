@@ -1115,22 +1115,23 @@ export default function (pi: ExtensionAPI) {
       const bs = cfg.borderStatus as Partial<BorderStatus>;
       for (;;) {
         const opts = [
-          `${bs.progress ? "[x]" : "[ ]"} Progress bar`,
-          `${bs.percentage ? "[x]" : "[ ]"} Percentage`,
-          `${bs.path ? "[x]" : "[ ]"} Path`,
-          `${bs.model ? "[x]" : "[ ]"} Model name`,
+          `${bs.model ? "[x]" : "[ ]"} Model name          (top)`,
+          `${bs.progress ? "[x]" : "[ ]"} Progress bar        (bottom)`,
+          `${bs.percentage ? "[x]" : "[ ]"} Percentage          (bottom)`,
+          `${bs.path ? "[x]" : "[ ]"} Path                (bottom)`,
           "Close",
         ];
         const choice = await ctx.ui.select("Status bar elements", opts);
         if (!choice || choice === "Close") break;
-        if (choice.includes("Progress")) bs.progress = !bs.progress;
+        if (choice.includes("Model")) bs.model = !bs.model;
+        else if (choice.includes("Progress")) bs.progress = !bs.progress;
         else if (choice.includes("Percentage")) bs.percentage = !bs.percentage;
         else if (choice.includes("Path")) bs.path = !bs.path;
-        else if (choice.includes("Model")) bs.model = !bs.model;
         else break;
         saveCfg();
         applyEditor(ctx);
-        ctx.ui.notify(`${choice.replace(/\[.\] /, "")}: ${!!(bs.progress ?? bs.percentage ?? bs.path ?? bs.model) ? "on" : "off"}`);
+        const name = choice.replace(/\[.\] /, "").split(" ")[0];
+        ctx.ui.notify(`${name}: ${choice.includes("[x]") ? "on" : "off"}`);
       }
     },
   });
