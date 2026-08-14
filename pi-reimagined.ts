@@ -788,10 +788,6 @@ function buildBox(text: string, width: number, theme: any, active: boolean, ms: 
   return [top, ...body, bot];
 }
 
-// Per-message reasoning timing. Keyed by the message object (stable ref across
-// updates, finalize, and re-renders). end unset -> still thinking.
-const thinkTimes = new WeakMap<object, { start: number; end?: number }>();
-
 // Live AssistantMessageComponents, for recoloring history on palette change.
 // Host components bake theme colors at updateContent time and aren't rebuilt by
 // setTheme, so we re-run updateContent on each to repaint with the new palette.
@@ -944,21 +940,25 @@ async function patchThinking(): Promise<void> {
 
   // Width-aware ember box: Container subclass that renders a rounded border
   // around a Markdown child (so code blocks, headings, etc. render properly).
+  // Timing lives on the OWNING component (one component = one assistant
+  // message, stable across deltas) — stream events hand out fresh message
+  // objects every delta, so keying timing by message identity never matched.
   class ThinkBox extends Container {
     text: string;
-    msg: any;
+    comp: any;
     private _mdTheme: any;
-    constructor(text: string, msg: any, mdTheme: any) {
+    constructor(text: string, comp: any, mdTheme: any) {
       super();
       this.text = text;
-      this.msg = msg;
+      this.comp = comp;
       this._mdTheme = mdTheme;
       this.addChild(new Markdown(text, 0, 0, mdTheme));
     }
     render(width: number): string[] {
-      const t = thinkTimes.get(this.msg);
-      const active = !!t && t.end == null && this.msg.stopReason == null;
-      const ms = t ? (t.end ?? Date.now()) - t.start : 0;
+      const t0 = this.comp._thinkStart;
+      const t1 = this.comp._thinkEnd;
+      const active = t0 != null && t1 == null;
+      const ms = t0 ? (t1 ?? Date.now()) - t0 : 0; // live elapsed while active
       const c = active ? P.base : THINK_GREY;
       const b = (s: string) => tc(c[0], c[1], c[2], s);
 
@@ -970,9 +970,14 @@ async function patchThinking(): Promise<void> {
       }
       const padded = childLines.map((line: string) => b("│") + " " + line + " " + b("│"));
 
-      const title = active ? " thinking " : ` thought for ${fmtDur(ms)} `;
-      const top = b("╭") + title + b("─".repeat(Math.max(0, width - 2 - VW(title))) + "╮");
-      const bot = b("╰" + "─".repeat(Math.max(0, width - 2)) + "╯");
+      // Label bottom-right: stays visible while the box grows upward from it.
+      const title = !t0
+        ? " thought "
+        : active
+          ? ` thinking ${fmtDur(ms)} `
+          : ` thought for ${fmtDur(ms)} `;
+      const top = b("╭" + "─".repeat(Math.max(0, width - 2)) + "╮");
+      const bot = b("╰" + "─".repeat(Math.max(0, width - 3 - VW(title))) + title + "─╯");
       return [top, ...padded, bot];
     }
   }
@@ -982,6 +987,23 @@ async function patchThinking(): Promise<void> {
   am.AssistantMessageComponent.prototype.updateContent = function (message: any) {
     this.lastMessage = message;
     liveMsgs.add(this); // track for palette-change recolor
+    // Reasoning timing, keyed on this component (stable across the message's
+    // delta updates). start: first update carrying non-empty thinking.
+    // end: message finalized, or content after the thinking block appeared.
+    // NOTE: in-flight messages have stopReason === "pending" (every pi-ai
+    // provider), NOT null — null/undefined only on reloaded history messages.
+    const live = message.stopReason == null || message.stopReason === "pending";
+    const thinkIdx = message.content.findIndex((c: any) => c.type === "thinking" && c.thinking?.trim());
+    // Only start the clock while the message is still live — a finalized
+    // (reloaded/history) message has no recoverable timing, shows " thought ".
+    if (thinkIdx >= 0 && !this._thinkStart && live) this._thinkStart = Date.now();
+    const contentAfterThink = thinkIdx >= 0 &&
+      message.content.slice(thinkIdx + 1).some(
+        (c: any) => (c.type === "text" && c.text?.trim()) || c.type === "toolCall",
+      );
+    if (this._thinkStart && !this._thinkEnd && (!live || contentAfterThink)) {
+      this._thinkEnd = Date.now();
+    }
     this.contentContainer.clear();
     const visible = (c: any) =>
       (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim());
@@ -1000,7 +1022,7 @@ async function patchThinking(): Promise<void> {
             new Text(T.italic(T.fg("thinkingText", this.hiddenThinkingLabel)), 1, 0),
           );
         } else if (cfg.thinkBox) {
-          this.contentContainer.addChild(new ThinkBox(thinkingText, message, this.markdownTheme));
+          this.contentContainer.addChild(new ThinkBox(thinkingText, this, this.markdownTheme));
         } else {
           this.contentContainer.addChild(
             new Markdown(thinkingText, 1, 0, this.markdownTheme, {
@@ -1115,6 +1137,41 @@ async function patchNotifications(): Promise<void> {
   };
 }
 
+// The host's Markdown component hardcodes literal ``` fence lines for code
+// blocks (only color/indent are themeable). Replace the "code" token branch
+// with a rounded box matching the extension's visual language.
+let patchedCodeBlocks = false;
+async function patchCodeBlocks(): Promise<void> {
+  if (patchedCodeBlocks) return;
+  patchedCodeBlocks = true;
+  const { tui } = await loadHost();
+  const MD = tui.Markdown;
+  const orig = MD.prototype.renderToken;
+  MD.prototype.renderToken = function (token: any, width: number, nextTokenType: string | undefined, styleContext: any) {
+    if (token?.type !== "code") return orig.call(this, token, width, nextTokenType, styleContext);
+    const w = width; // contentWidth from render()
+    if (w < 10) return orig.call(this, token, width, nextTokenType, styleContext); // too narrow for a box
+    const th = this.theme;
+    const src: string = token.text ?? "";
+    let body: string[] = th.highlightCode
+      ? th.highlightCode(src, token.lang)
+      : src.split("\n").map((l: string) => th.codeBlock(l));
+    if (body.length && body[body.length - 1] === "") body.pop(); // trailing newline guard
+    body = body.flatMap((l) => (tui.visibleWidth(l) <= w - 4 ? [l] : tui.wrapTextWithAnsi(l, w - 4)));
+    const border = (s: string) => th.codeBlockBorder(s);
+    const label = token.lang ? ` ${token.lang} ` : "";
+    const L = tui.visibleWidth(label);
+    if (w - 3 - L < 1) return orig.call(this, token, width, nextTokenType, styleContext); // label too long
+    return [
+      border("╭─" + label + "─".repeat(w - 3 - L) + "╮"),
+      ...body.map((l) => border("│ ") + l + " ".repeat(Math.max(0, w - 4 - tui.visibleWidth(l))) + border(" │")),
+      border("╰" + "─".repeat(w - 2) + "╯"),
+      // mirror host spacing: blank line after block unless a space token follows
+      ...(nextTokenType && nextTokenType !== "space" ? [""] : []),
+    ];
+  };
+}
+
 // Live preview: swap brand RGB + pair the pi theme. setTheme triggers a full
 // re-render so the visible transcript recolors. No editor swap here — the picker
 // occupies the editor slot during selection, so touching it would clobber it.
@@ -1210,6 +1267,7 @@ export default function (pi: ExtensionAPI) {
         appendFileSync(join(homedir(), ".pi/agent/logs/patch.log"), "patchThinking ERROR: " + (e as Error).message + "\n");
       }); // ember-box the inline thinking trace
       patchNotifications().catch(() => {}); // recolor package-update line on palette change
+      patchCodeBlocks().catch(() => {}); // rounded boxes for markdown code blocks
     }, 0);
 
     // Status lives in the box border. Footer is hidden when roundedBox is on
@@ -1259,20 +1317,6 @@ export default function (pi: ExtensionAPI) {
       tick++;
       ctx.ui.setWorkingMessage(glow(word, phase) + BASE_PRE + dots + RST);
     }, GLOW_TICK_MS);
-  });
-
-  // Time the reasoning per message: first thinking_start .. last thinking_end.
-  pi.on("message_update", (e: any) => {
-    const m = e?.message;
-    const t = e?.assistantMessageEvent?.type;
-    if (!m) return;
-    if (t === "thinking_start") {
-      if (!thinkTimes.has(m)) thinkTimes.set(m, { start: Date.now() });
-    } else if (t === "thinking_end") {
-      const rec = thinkTimes.get(m) || { start: Date.now() };
-      rec.end = Date.now();
-      thinkTimes.set(m, rec);
-    }
   });
 
   pi.on("agent_end", (_e, ctx) => {

@@ -36,10 +36,22 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
   palette gradient + animated horizontal crest sweep (top→bottom), host info on the
   right, palette divider. Sweep runs once at startup then settles to plain gradient.
 - **Inline thinking box** — monkeypatches `AssistantMessageComponent.prototype.updateContent`
-  (only the thinking branch) so reasoning renders in a live rounded box with timing
-  ("thought for Xs" when done, ember-colored while active). `collapseThinking` toggle
-  hides thinking behind a muted italic label. `thinkTimes` `WeakMap` tracks per-message
-  start/end. Context untouched.
+  (only the thinking branch) so reasoning renders in a live rounded box with timing in the
+  **bottom-right** border (" thinking Xs " counting live while active, " thought for Xs "
+  grey when done). `collapseThinking` toggle hides thinking behind a muted italic label.
+  Context untouched.
+  - Timing is keyed on the **component** (`this._thinkStart/_thinkEnd`), set in
+    `updateContent`: one `AssistantMessageComponent` = one assistant message, stable across
+    deltas. DON'T key by message object — the stream hands out a fresh `event.message` per
+    delta (`this.streamingMessage = event.message`), so a `WeakMap` on message identity
+    never matched (was the "always thought for 1s" bug). History/reloaded messages arrive
+    finalized → no clock started → plain " thought " label.
+- **Code-block boxes** — monkeypatches `Markdown.prototype.renderToken` (pi-tui): the host
+  hardcodes literal ``` fence lines for `code` tokens (only color/indent are themeable). The
+  `code` branch is replaced with a rounded box (╭╮╰╯, lang label in the top border, content
+  wrapped via `wrapTextWithAnsi` to width-4). Falls back to the host branch when the width is
+  < 10 or the lang label overflows. Border/content colors still come from the instance's
+  markdown theme (`codeBlockBorder`/`codeBlock`/`highlightCode`), so palettes apply for free.
 - **Update-notification recolor** — monkeypatches both `showNewVersionNotification` and
   `showPackageUpdateNotification`: the host bakes `theme.fg("warning", …)` (amber in every
   palette) into one-shot `Text` children that `rebuildLiveMessages()` never touches. Both are
@@ -82,6 +94,9 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 - `execSync` **inherits stderr by default** (stdio `['ignore','pipe','inherit']`), unlike `spawnSync`. A child's stderr (e.g. git CRLF warnings from `git diff` under `core.autocrlf`) writes raw to the TTY, painting over the fullscreen UI and desyncing the renderer's diff → full redraws. Always pass `stdio: ["ignore","pipe","ignore"]` on extension-side `execSync` calls.
 - `theme.fg("warning", …)` is amber in every shipped palette — don't use it for anything
   meant to be palette-tinted; use `accent`.
+- Streaming assistant messages carry `stopReason: "pending"` (every pi-ai provider),
+  NOT null. `stopReason == null` only happens on reloaded/history messages. Treat
+  `stopReason == null || === "pending"` as "live".
 - pi-tui's `TUI.render` scrolls the real terminal buffer (`tui.js`: pushes `\r\n`, tracks
   `viewportTop`) — scrolling to prior messages is native terminal scrollback, not an
   app-managed viewport. **Never manually enter alt-screen** (`\x1b[?1049h`) — use pi's
