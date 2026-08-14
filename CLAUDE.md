@@ -21,20 +21,45 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 - **Palette system.** `PALETTES` map (ember/void/ocean/forest). Each entry = brand
   RGB (`base`, `crest`, `prompt`) the theme JSON can't express + glyphs (`promptChar`,
   `star`, `spinner`) + the name of a paired theme JSON. `applyPalette()` rebuilds the
-  derived ANSI (`BASE_PRE`, `SPIN`, `PROMPT`, `STAR`) into module-level `let`s. Switching
-  a palette drives both the brand RGB and `ctx.ui.setTheme(P.theme)`.
+  derived ANSI (`BASE_PRE`, `SPIN`, `PROMPT`, `STAR`) into module-level `let`s.
+  Palette picker (`/pi-reimagined > Palette`) uses pi-tui's `SelectList` with live hover
+  preview (`onSelectionChange` calls `previewPalette`). Switching a palette drives both
+  the brand RGB and `ctx.ui.setTheme(P.theme)`, then `rebuildLiveMessages()` re-bakes
+  past messages with the new theme proxy.
 - **Rounded input box** — `EmberEditor extends CustomEditor`, decorates rendered rows
-  (corners, side `│`, prompt `❯`, status baked into border). Scrolling handled by
+  (corners, side `│`, prompt `❯`, status baked into border). Border status is
+  granular: model name (top), progress bar + percentage + path + branch + cache hits
+  + diff stats (bottom), each independently toggleable via `/status-bar`. Ctrl+C
+  double-press exits (first press shows italic warning for 500ms). Scrolling handled by
   TuiAltScreen's ScrollView, not manual scrollOffset.
 - **Custom header** — `ctx.ui.setHeader(factory)`; `PI` block letters with a vertical
-  palette gradient, host info on the right, palette divider.
+  palette gradient + animated horizontal crest sweep (top→bottom), host info on the
+  right, palette divider. Sweep runs once at startup then settles to plain gradient.
 - **Inline thinking box** — monkeypatches `AssistantMessageComponent.prototype.updateContent`
-  (only the thinking branch) so reasoning renders in a live box. Context untouched.
-- **Package-update recolor** — monkeypatches `InteractiveMode.prototype.showPackageUpdateNotification`,
-  swapping the baked `Text` body for a live component and recoloring `warning`→`accent`
-  so the box follows the palette.
-- **Config** — `~/.pi/agent/pi-reimagined.config.json` (feature toggles + palette). Runtime
-  state, gitignored, not part of source.
+  (only the thinking branch) so reasoning renders in a live rounded box with timing
+  ("thought for Xs" when done, ember-colored while active). `collapseThinking` toggle
+  hides thinking behind a muted italic label. `thinkTimes` `WeakMap` tracks per-message
+  start/end. Context untouched.
+- **Update-notification recolor** — monkeypatches both `showNewVersionNotification` and
+  `showPackageUpdateNotification`: the host bakes `theme.fg("warning", …)` (amber in every
+  palette) into one-shot `Text` children that `rebuildLiveMessages()` never touches. Both are
+  rewritten with live `LiveText` bodies + `DynamicBorder` accent borders that re-read the shared
+  theme proxy per render, so the boxes follow the active palette. (Version box drops OSC8
+  hyperlink + Markdown note rendering — ponytail: URL stays visible as text.)
+- **Loaded resources hidden** — monkeypatches `InteractiveMode.prototype.showLoadedResources`
+  to clear the startup Context/Extensions/Themes info block (still accessible via ctrl+o).
+- **Glow text** — `agent_start` picks a random fun word ("Bamboozling", "Smelting", …)
+  and animates a per-char glow sweep (crest traveling left→right) via `setWorkingMessage`.
+- **Sparkle spinner** — `setWorkingIndicator` with palette-specific frames (e.g. dots
+  coalescing into a star for void).
+- **Footer** — custom `setFooter` single-line status bar (path, progress, model). Hidden
+  (returns empty) when `roundedBox` is on; `allocateStackSizes` is patched to force
+  footer minSize to 0 so no blank line leaks.
+- **Scrollbar** — `scrollbarStyle` set to palette base RGB; `wheelScrollLines` boosted to 3.
+- **Config** — `~/.pi/agent/pi-reimagined.config.json` (feature toggles + palette +
+  granular `BorderStatus`). `BorderStatus` is either `true` (all defaults) or a partial
+  object with per-element bools (model, progress, percentage, path, branch, cacheHits,
+  diffStats). Runtime state, gitignored, not part of source.
 
 ## Key host facts (learned the hard way)
 
@@ -51,6 +76,10 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
   host; `loadHost().T` is the same object `setTheme` mutates.
 - Notifications fire once at process start (`run()` after `init()`), so the monkeypatch
   installed in `session_start` is in place before they fire.
+- `allocateStackSizes` (from `pi-tui/dist/components/stack.js`) can be patched to override
+  per-entry `minSize`. We use it to collapse the footer container to 0 lines when
+  `roundedBox` is on (host default is minSize:1, which leaves a blank line).
+- `execSync` **inherits stderr by default** (stdio `['ignore','pipe','inherit']`), unlike `spawnSync`. A child's stderr (e.g. git CRLF warnings from `git diff` under `core.autocrlf`) writes raw to the TTY, painting over the fullscreen UI and desyncing the renderer's diff → full redraws. Always pass `stdio: ["ignore","pipe","ignore"]` on extension-side `execSync` calls.
 - `theme.fg("warning", …)` is amber in every shipped palette — don't use it for anything
   meant to be palette-tinted; use `accent`.
 - pi-tui's `TUI.render` scrolls the real terminal buffer (`tui.js`: pushes `\r\n`, tracks
@@ -66,6 +95,13 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 - No emoji. Text-presentation dingbats only (`✷ ✶ ✸ ✦ ○ ❀ ✿`); avoid glyphs that render
   as colored emoji or carry VS16.
 - Keep it lazy: shortest diff that works, mark deliberate shortcuts with `ponytail:` comments.
+
+## Commands
+
+- `/pi-reimagined` — toggle features (rounded box, prompt char, glow text, sparkle
+  spinner, think box, collapse thinking, custom header) + open palette picker
+- `/status-bar` — toggle individual border status elements (model, progress bar,
+  percentage, cache hits, path, git branch, diff stats)
 
 ## Testing
 

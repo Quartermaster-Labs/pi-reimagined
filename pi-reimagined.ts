@@ -265,6 +265,8 @@ interface BoxInfo {
 
 const CTRLC_EXIT_MS = 500; // double-press window; warning label lives exactly this long
 
+let _renderDiag = false; // one-time diagnostic flag
+
 class EmberEditor extends CustomEditor {
   getInfo?: () => BoxInfo;
   private ctrlCWarnUntil = 0; // Date.now() deadline; render() shows exit hint until then
@@ -329,68 +331,146 @@ class EmberEditor extends CustomEditor {
     );
   }
 
+  // Build a corner row with both left and right labels.
+  // Both labels get same style as corners(): space + label + space, surrounded by dashes.
+  private cornersLR(
+    lc: string,
+    rc: string,
+    width: number,
+    leftLabel: string,
+    leftLen: number,
+    rightLabel: string,
+    rightLen: number,
+  ): string {
+    const paint = this.borderColor;
+    const inner = Math.max(0, width - 2);
+    const SAFE = 2;
+    const PAD = 1;
+    // lc + fillL + PAD + left + PAD + fillR + PAD + right + PAD + SAFE + rc = width
+    const leftNeed = leftLen + PAD * 2;
+    const rightNeed = rightLen + PAD * 2 + SAFE;
+    // lc(1) + sp(1) + left + sp(1) + fill + sp(1) + right + sp(1) + safe(2) + rc(1) = width
+    // fill = width - leftLen - rightLen - 8 = inner - leftLen - rightLen - 6
+    const fill = inner - leftLen - rightLen - 6;
+    if (fill < 0) {
+      return paint(lc) + paint("─".repeat(inner)) + paint(rc); // not enough room
+    }
+    // lc + space + left + space + fill + space + right + space + SAFE + rc = width
+    return (
+      paint(lc) +
+      " " + leftLabel + " " +
+      "─".repeat(Math.max(0, fill)) +
+      " " + rightLabel + " " +
+      paint("─".repeat(SAFE)) +
+      paint(rc)
+    );
+  }
+
   // left-truncate a string to max visible chars, prefixing … when cut
   private fitTail(s: string, max: number): string {
     return VW(s) <= max ? s : "…" + s.slice(-(max - 1));
   }
 
   render(width: number): string[] {
-    const lines = super.render(width);
-    if (!cfg.roundedBox) return lines; // box disabled -> stock rendering
+    const rawLines = super.render(width);
+    if (!cfg.roundedBox) return rawLines; // box disabled -> stock rendering
     const paint = this.borderColor; // respects theme + bash-mode color cue
     const V = paint("│");
-    // top = first pure-─ row, bottom = last pure-─ row (robust if scroll rows present)
-    const pure = lines
-      .map((l, i) => (/^─+$/.test(stripAnsi(l)) ? i : -1))
-      .filter((i) => i >= 0);
-    const topI = pure[0];
-    const botI = pure[pure.length - 1];
-    const promptI = topI + 1; // first text row sits right below the top border
 
-    // Compose the two labels (width-aware so long model/dir truncate, not drop).
-    // Compose the two labels (width-aware so long model/dir truncate, not drop).
+    // Detect scroll indicator line ("↑ N more ──────────────") from editor output.
+    // When content overflows, CustomEditor replaces the top border with this.
+    // We extract the scroll text, bake it into our top border, and drop the raw line.
+    const scrollRe = /^(.+?\s+more)\s*─*$/;
+    let scrollLabel: string | null = null;
+    const _stripPure = (ls: string[], side: "start" | "end") => {
+      // Check if the first/last line is a pure ── or scroll indicator
+      const idx = side === "start" ? 0 : ls.length - 1;
+      const line = stripAnsi(ls[idx]);
+      if (/^─+$/.test(line) || scrollRe.test(line)) {
+        if (scrollRe.test(line) && !/^─+$/.test(line)) {
+          const m = line.match(scrollRe);
+          if (m) scrollLabel = scrollLabel ?? m[1]; // capture first scroll label found
+        }
+        const rest = side === "start" ? ls.slice(1) : ls.slice(0, -1);
+        return rest;
+      }
+      return ls;
+    };
+
+    // Strip original top/border rows (scroll indicator or plain ──)
+    if (rawLines.length > 0 && !_renderDiag) {
+      const raw0 = stripAnsi(rawLines[0]);
+      const hexChars = [...raw0].map(c => c.charCodeAt(0).toString(16)).join(' ');
+      console.error(`DIAG: raw[0]=[${raw0}] hex=[${hexChars}] scrollMatch=${scrollRe.test(raw0)}`);
+      _renderDiag = true;
+    }
+    let contentLines = _stripPure(rawLines, "start");
+    contentLines = _stripPure(contentLines, "end");
+
+    // Ensure bottom border exists
+    const dash = "─".repeat(width);
+    const _checkPure = (ls: string[]) =>
+      ls.map((l: string, i: number) => (/^─+$/.test(stripAnsi(l)) ? i : -1)).filter((i: number) => i >= 0);
+    const _pure = _checkPure(contentLines);
+    const renderLines = _pure.length > 0
+      ? contentLines // bottom border present
+      : [...contentLines, dash]; // synthesize bottom
+
+    // Bottom border index in renderLines
+    const pure = _checkPure(renderLines);
+    const botI = pure[pure.length - 1] ?? (renderLines.length - 1);
+    const promptI = 0; // first content row gets the prompt char
+
+    // Compose the labels (width-aware so long model/dir truncate, not drop).
     const info = cfg.borderStatus ? this.getInfo?.() : undefined;
     const budget = Math.max(0, width - 2) - 2 /*SAFE*/ - 2 /*PAD*/;
     let topLabel = "", topLen = 0, botLabel = "", botLen = 0;
-    if (info) {
-      // Top label: model (optional)
-      if (bsOn("model")) {
-        const starRoom = VW(" " + STAR);
-        const model = this.fitTail(info.model, Math.max(0, budget - starRoom));
-        topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
-        topLen = VW(topLabel);
-      }
+    // Left label: scroll indicator (only when content overflows)
+    let leftScrollLabel = "", leftScrollLen = 0;
+    if (scrollLabel) {
+      leftScrollLabel = tc(P.base[0], P.base[1], P.base[2], scrollLabel);
+      leftScrollLen = VW(scrollLabel);
+    }
+    // Right label: model name (account for left scroll label when present)
+    const availForRight = leftScrollLen > 0 ? budget - leftScrollLen - 1 : budget;
+    if (info && bsOn("model")) {
+      const starRoom = VW(" " + STAR);
+      const model = this.fitTail(info.model, Math.max(0, availForRight - starRoom));
+      topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
+      topLen = VW(topLabel);
+    }
 
       // Bottom label: progress bar + percentage + path + branch + cacheHits + diffStats (each optional)
-      const parts: string[] = [];
-      if (bsOn("progress") || bsOn("percentage")) {
-        const bar = ctxBar(info.percent);
-        const [r, g, b] = barRgb(info.percent);
-        parts.push(tc(r, g, b, bar.text));
+      if (info) {
+        const parts: string[] = [];
+        if (bsOn("progress") || bsOn("percentage")) {
+          const bar = ctxBar(info.percent);
+          const [r, g, b] = barRgb(info.percent);
+          parts.push(tc(r, g, b, bar.text));
+        }
+        if (bsOn("cacheHits") && info.cacheHits > 0) {
+          const fmt = info.cacheHits >= 1_000_000 ? `${(info.cacheHits / 1_000_000).toFixed(1)}M` : info.cacheHits >= 1_000 ? `${Math.round(info.cacheHits / 1000)}k` : `${info.cacheHits}`;
+          parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], `cache: ${fmt}`));
+        }
+        if (bsOn("path")) {
+          const DIR_MAX = 48;
+          const dir = this.fitTail(info.dir, Math.min(DIR_MAX, Math.max(0, budget - parts.reduce((s, p) => s + VW(p), 0))));
+          if (dir.length >= 1) parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], dir));
+        }
+        if (bsOn("branch") && info.branch) {
+          parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], `(${info.branch})`));
+        }
+        if (bsOn("diffStats") && (info.diffAdded > 0 || info.diffRemoved > 0)) {
+          const added = info.diffAdded > 0 ? tc(0, 180, 80, `+${info.diffAdded}`) : "";
+          const removed = info.diffRemoved > 0 ? tc(180, 0, 0, `-${info.diffRemoved}`) : "";
+          const sep = added && removed ? " " : "";
+          parts.push(added + sep + removed);
+        }
+        if (parts.length) {
+          botLabel = parts.join(paint(" ") + paint("─".repeat(2)) + paint(" "));
+          botLen = VW(botLabel);
+        }
       }
-      if (bsOn("cacheHits") && info.cacheHits > 0) {
-        const fmt = info.cacheHits >= 1_000_000 ? `${(info.cacheHits / 1_000_000).toFixed(1)}M` : info.cacheHits >= 1_000 ? `${Math.round(info.cacheHits / 1000)}k` : `${info.cacheHits}`;
-        parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], `cache: ${fmt}`));
-      }
-      if (bsOn("path")) {
-        const DIR_MAX = 48;
-        const dir = this.fitTail(info.dir, Math.min(DIR_MAX, Math.max(0, budget - parts.reduce((s, p) => s + VW(p), 0))));
-        if (dir.length >= 1) parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], dir));
-      }
-      if (bsOn("branch") && info.branch) {
-        parts.push(tc(DIR_C[0], DIR_C[1], DIR_C[2], `(${info.branch})`));
-      }
-      if (bsOn("diffStats") && (info.diffAdded > 0 || info.diffRemoved > 0)) {
-        const added = info.diffAdded > 0 ? tc(0, 180, 80, `+${info.diffAdded}`) : "";
-        const removed = info.diffRemoved > 0 ? tc(180, 0, 0, `-${info.diffRemoved}`) : "";
-        const sep = added && removed ? " " : "";
-        parts.push(added + sep + removed);
-      }
-      if (parts.length) {
-        botLabel = parts.join(paint(" ") + paint("─".repeat(2)) + paint(" "));
-        botLen = VW(botLabel);
-      }
-    }
     if (Date.now() < this.ctrlCWarnUntil) {
       const warn = "press ctrl+c again to exit";
       const [r, g, b] = P.prompt;
@@ -398,8 +478,7 @@ class EmberEditor extends CustomEditor {
       botLen = VW(warn);
     }
 
-    return lines.map((line, i) => {
-      if (i === topI) return this.corners("╭", "╮", width, topLabel, topLen);
+    const bodyLines = renderLines.map((line, i) => {
       if (i === botI) return this.corners("╰", "╯", width, botLabel, botLen);
       let out = line;
       const left = i === promptI && cfg.promptChar ? PROMPT : V; // ❯ on first row
@@ -407,6 +486,10 @@ class EmberEditor extends CustomEditor {
       if (out.endsWith(" ")) out = out.slice(0, -1) + V;
       return out;
     });
+    const topBorder = leftScrollLabel
+      ? this.cornersLR("╭", "╮", width, leftScrollLabel, leftScrollLen, topLabel, topLen)
+      : this.corners("╭", "╮", width, topLabel, topLen);
+    return [topBorder, ...bodyLines];
   }
 }
 
@@ -424,13 +507,15 @@ function updateBorderCache(): void {
     const { execSync } = require("child_process");
     // Git branch
     try {
-      borderCache.branch = execSync("git branch --show-current", { cwd, encoding: "utf8" }).trim() || "";
+      // ponytail: execSync inherits stderr by default — git CRLF/fatal messages would
+      // otherwise paint raw onto the TTY every tick, over the fullscreen UI.
+      borderCache.branch = execSync("git branch --show-current", { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || "";
     } catch {
       borderCache.branch = "";
     }
     // Diff stats (staged + unstaged)
     try {
-      const diff = execSync("git diff --numstat", { cwd, encoding: "utf8" }).trim();
+      const diff = execSync("git diff --numstat", { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
       let added = 0, removed = 0;
       if (diff) {
         for (const line of diff.split("\n")) {
@@ -817,22 +902,78 @@ async function patchThinking(): Promise<void> {
   const { tui, T } = await loadHost();
   const { Spacer, Text, Markdown, Container } = tui;
 
-  // Width-aware ember box as a host Container subclass (so it slots into the
-  // content container and gets the real render width).
+  // Normalize indented code fences: some LLMs emit "   ```go" which certain
+  // Markdown parsers silently reject (treating as literal text). Strip leading
+  // whitespace ONLY from fence markers (opening/closing ``` lines), preserve
+  // indentation inside the block body.
+  function normalizeFences(text: string): string {
+    // Normalize line endings first (\r\n breaks fence detection)
+    text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    // Convert fenced code blocks to indented (4-space) blocks.
+    // Fallback for Markdown renderers that don't support fenced syntax.
+    const out: string[] = [];
+    let inFence = false;
+    let fenceIndent = "";
+    for (const line of text.split("\n")) {
+      const leadingMatch = line.match(/^(\s*)/);
+      const leading = leadingMatch ? leadingMatch[1] : "";
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith("```") && trimmed.match(/^````*\s*\w*\s*$/)) {
+        if (!inFence) {
+          inFence = true;
+          fenceIndent = leading; // remember fence indent
+          continue; // skip opening fence
+        } else {
+          inFence = false;
+          fenceIndent = "";
+          continue; // skip closing fence
+        }
+      } else if (inFence) {
+        // Strip the fence indent from body lines (LLMs often indent body with fence)
+        let bodyLine = line;
+        if (fenceIndent && bodyLine.startsWith(fenceIndent)) {
+          bodyLine = bodyLine.slice(fenceIndent.length);
+        }
+        out.push("    " + bodyLine); // 4-space indent = code block in standard markdown
+      } else {
+        out.push(line);
+      }
+    }
+    return out.join("\n");
+  }
+
+  // Width-aware ember box: Container subclass that renders a rounded border
+  // around a Markdown child (so code blocks, headings, etc. render properly).
   class ThinkBox extends Container {
     text: string;
     msg: any;
-    constructor(text: string, msg: any) {
+    private _mdTheme: any;
+    constructor(text: string, msg: any, mdTheme: any) {
       super();
       this.text = text;
       this.msg = msg;
+      this._mdTheme = mdTheme;
+      this.addChild(new Markdown(text, 0, 0, mdTheme));
     }
     render(width: number): string[] {
       const t = thinkTimes.get(this.msg);
-      // active while a start is logged but no end yet (and msg not finalized)
       const active = !!t && t.end == null && this.msg.stopReason == null;
       const ms = t ? (t.end ?? Date.now()) - t.start : 0;
-      return buildBox(this.text, width, T, active, ms);
+      const c = active ? P.base : THINK_GREY;
+      const b = (s: string) => tc(c[0], c[1], c[2], s);
+
+      // Render children at reduced width (border adds │ + space + space + │ = 4)
+      const innerW = Math.max(2, width - 4);
+      const childLines: string[] = [];
+      for (const child of this.children) {
+        childLines.push(...(child as any).render(innerW));
+      }
+      const padded = childLines.map((line: string) => b("│") + " " + line + " " + b("│"));
+
+      const title = active ? " thinking " : ` thought for ${fmtDur(ms)} `;
+      const top = b("╭") + title + b("─".repeat(Math.max(0, width - 2 - VW(title))) + "╮");
+      const bot = b("╰" + "─".repeat(Math.max(0, width - 2)) + "╯");
+      return [top, ...padded, bot];
     }
   }
 
@@ -848,18 +989,21 @@ async function patchThinking(): Promise<void> {
     for (let i = 0; i < message.content.length; i++) {
       const content = message.content[i];
       if (content.type === "text" && content.text.trim()) {
-        this.contentContainer.addChild(new Markdown(content.text.trim(), 1, 0, this.markdownTheme));
+        this.contentContainer.addChild(
+          new Markdown(normalizeFences(content.text.trim()), 1, 0, this.markdownTheme),
+        );
       } else if (content.type === "thinking" && content.thinking.trim()) {
         const after = message.content.slice(i + 1).some(visible);
+        const thinkingText = normalizeFences(content.thinking.trim());
         if (this.hideThinkingBlock || cfg.collapseThinking) {
           this.contentContainer.addChild(
             new Text(T.italic(T.fg("thinkingText", this.hiddenThinkingLabel)), 1, 0),
           );
         } else if (cfg.thinkBox) {
-          this.contentContainer.addChild(new ThinkBox(content.thinking.trim(), message));
+          this.contentContainer.addChild(new ThinkBox(thinkingText, message, this.markdownTheme));
         } else {
           this.contentContainer.addChild(
-            new Markdown(content.thinking.trim(), 1, 0, this.markdownTheme, {
+            new Markdown(thinkingText, 1, 0, this.markdownTheme, {
               color: (t: string) => T.fg("thinkingText", t),
               italic: true,
             }),
@@ -928,6 +1072,30 @@ async function patchNotifications(): Promise<void> {
   // User can still see it via ctrl+o (different code path).
   im.InteractiveMode.prototype.showLoadedResources = function (_options?: any) {
     this.loadedResourcesContainer?.clear();
+  };
+
+  im.InteractiveMode.prototype.showNewVersionNotification = function (release: any) {
+    // Host bakes "warning" (amber in every palette) into a one-shot Text. Make it
+    // live + accent-tinted so it follows the active palette like the package box.
+    const changelogUrl = "https://pi.dev/changelog";
+    const body = () => {
+      const action = T.fg("accent", `pi update`);
+      const instruction = T.fg("muted", `New version ${release.version} is available. Run `) + action;
+      const link = T.fg("accent", changelogUrl);
+      const changelogLine = T.fg("muted", "Changelog: ") + link;
+      return `${T.bold(T.fg("accent", "Update Available"))}\n${instruction}\n${changelogLine}`;
+    };
+    this.chatContainer.addChild(new Spacer(1));
+    this.chatContainer.addChild(new DynamicBorder((t: string) => T.fg("accent", t)));
+    this.chatContainer.addChild(new LiveText(body));
+    const note = release.note?.trim();
+    if (note) {
+      this.chatContainer.addChild(new Spacer(1));
+      this.chatContainer.addChild(new LiveText(() => T.fg("muted", note)));
+      this.chatContainer.addChild(new Spacer(1));
+    }
+    this.chatContainer.addChild(new DynamicBorder((t: string) => T.fg("accent", t)));
+    this.ui.requestRender();
   };
 
   im.InteractiveMode.prototype.showPackageUpdateNotification = function (packages: string[]) {
