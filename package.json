@@ -1,7 +1,7 @@
 {
   "name": "pi-reimagined",
   "version": "0.1.0",
-  "description": "A reimagined TUI for the pi coding agent: rounded input box, glowing working text, sparkle spinner, inline thinking box, a custom PI startup header, and switchable palettes (ember / void / ocean / forest).",
+  "description": "A reimagined TUI for the pi coding agent: rounded input box with live border status, glowing working text, sparkle spinner, turn stats, inline thinking box, rounded code-block boxes with syntax highlighting, mouse support in the chat input, a custom PI startup header, and switchable palettes (ember / void / ocean / forest).",
   "type": "module",
   "main": "pi-reimagined.ts",
   "files": [

@@ -29,7 +29,11 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 - **Rounded input box** — `EmberEditor extends CustomEditor`, decorates rendered rows
   (corners, side `│`, prompt `❯`, status baked into border). Border status is
   granular: model name (top), progress bar + percentage + path + branch + cache hits
-  + diff stats (bottom), each independently toggleable via `/status-bar`. The ctx-fill
+  + diff stats (bottom), each independently toggleable via `/status-bar`. The top
+  model label normally ends in a `✷` star; when the model supports reasoning and
+  thinking is on (`ctx.model.reasoning && ctx.thinkingLevel !== "off"`) it ends in
+  `○ <level>` instead (e.g. `gpt-x ○ xhigh`) — the level reads as the label
+  terminator, so the star is dropped (avoids `… ○ xhigh ○`). The ctx-fill
   bar has 4 glyph styles (`cfg.barStyle`, picked in `/status-bar`): blocks (█ + 1/8-cell
   edge + ░, default), diamonds (◆◇), dots (●○), shades (▓▒░). Two-color render:
   fill = bright theme accent (amber >70%, red >90% — `barFill()`), track + pct label =
@@ -152,8 +156,9 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 
 ## Key host facts (learned the hard way)
 
-- The package `exports` map only exposes `"."`. Host internals are deep-imported by
-  absolute `file://` URL under `%APPDATA%/npm/node_modules/@earendil-works/pi-coding-agent`.
+- The package `exports` map only exposes public entrypoints (`.`, `./rpc-entry`,
+  `./client`) — no host internals. Host internals are deep-imported by absolute
+  `file://` URL under `%APPDATA%/npm/node_modules/@earendil-works/pi-coding-agent`.
   Memoized in `loadHost()`. **This is the main publish blocker** — Windows/npm-global only.
 - `ctx.ui.setTheme` only invalidates; it does NOT rebuild host components. Components bake
   theme colors at construction. To recolor history we re-run `updateContent` on tracked
@@ -191,14 +196,16 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 ## Commands
 
 - `/pi-reimagined` — toggle features (rounded box, prompt char, glow text, sparkle
-  spinner, think box, collapse thinking, custom header) + open palette picker
+  spinner, turn stats, think box, collapse thinking, custom header) + open palette picker
 - `/status-bar` — toggle individual border status elements (model, progress bar,
   percentage, cache hits, path, git branch, diff stats) + open the bar-style picker
   (live hover preview in the border)
 
 ## Testing
 
-No automated harness — verified live in pi. After editing, copy to the live dir and
-**fully restart pi** (new process; extension reload does not re-fire `session_start` or
-re-emit startup notifications). `PI_DEBUG_REDRAW=1` logs full-redraw reasons to
-`~/.pi/agent/pi-debug.log`.
+- `node --check pi-reimagined.ts` — TS syntax gate (fast first check).
+- `node test-mouse.mjs` — mouse regression harness (editor box probing + click
+  targeting; wrapping, CJK wide chars, scrollOffset, rounded box, container probing).
+- Everything else verified live in pi: after editing, copy `pi-reimagined.ts` to
+  `~/.pi/agent/extensions/` and **fully restart pi** (new process; extension reload
+  does not re-fire `session_start` or re-emit startup notifications).

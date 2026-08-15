@@ -1541,8 +1541,9 @@ function usePalette(ctx: any, name: string): void {
 }
 
 // Palette picker with LIVE hover preview. ctx.ui.select can't preview on
-// highlight, so we drive pi-tui's SelectList directly in a custom overlay:
-// onSelectionChange previews, Enter commits, Esc reverts to the starting palette.
+// highlight, so we drive pi-tui's SelectList directly via ctx.ui.custom
+// (non-overlay, editor slot): onSelectionChange previews, Enter commits, Esc
+// reverts to the starting palette.
 async function pickPalette(ctx: any): Promise<void> {
   const { tui, themeMod } = await loadHost();
   const { SelectList } = tui;
@@ -1851,7 +1852,7 @@ export default function (pi: ExtensionAPI) {
         const choice = await ctx.ui.select("Status bar elements", opts);
         if (!choice || choice === "Close") break;
         if (choice.startsWith("Bar style")) {
-          await pickBarStyle(ctx); // live preview picker (overlay)
+          await pickBarStyle(ctx); // live preview picker (non-overlay, takes the editor slot)
           continue;
         }
         if (choice.includes("Model")) bs.model = !bs.model;
