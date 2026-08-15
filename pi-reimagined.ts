@@ -4,8 +4,9 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 
-// pi reimagined: rounded input box, glow working text, sparkle spinner, ember
-// thinking box, and switchable palettes (ember / void / ocean / forest).
+// pi reimagined: rounded input box, glow working text, sparkle spinner,
+// turn stats (elapsed + tokens), ember thinking box, and switchable palettes
+// (ember / void / ocean / forest).
 
 // --- persisted feature toggles (/pi-reimagined settings menu) --------------
 const CFG_PATH = join(
@@ -15,7 +16,7 @@ const CFG_PATH = join(
   "pi-reimagined.config.json",
 );
 interface BorderStatus {
-  progress: boolean; // [#######------] visual bar
+  progress: boolean; // context-fill bar (glyph style: cfg.barStyle)
   percentage: boolean; // 54%
   path: boolean; // E:\Apps\LLM\pi-reimagined
   model: boolean; // model-id
@@ -27,8 +28,10 @@ interface Cfg {
   roundedBox: boolean;
   promptChar: boolean;
   borderStatus: boolean | Partial<BorderStatus>; // true = all, object = per-element
+  barStyle: string; // context-fill bar glyphs (BAR_STYLES)
   glowText: boolean;
   sparkleSpinner: boolean;
+  turnStats: boolean;
   thinkBox: boolean;
   collapseThinking: boolean;
   customHeader: boolean;
@@ -43,8 +46,10 @@ const cfg: Cfg = {
   roundedBox: true,
   promptChar: true,
   borderStatus: true,
+  barStyle: "blocks",
   glowText: true,
   sparkleSpinner: true,
+  turnStats: true,
   thinkBox: true,
   collapseThinking: false,
   customHeader: true,
@@ -110,6 +115,7 @@ function loadCfg(): void {
   } catch {
     /* first run / unreadable -> keep defaults */
   }
+  if (!BAR_STYLES.includes(cfg.barStyle as BarStyle)) cfg.barStyle = "blocks";
 }
 function saveCfg(): void {
   try {
@@ -140,20 +146,56 @@ function piVersion(): string {
 // Colors come from the active theme via theme.fg(), so this stays palette-agnostic.
 
 const BAR_W = 13;
+type BarStyle = "blocks" | "diamonds" | "dots" | "shades";
+const BAR_STYLES: BarStyle[] = ["blocks", "diamonds", "dots", "shades"];
 function formatCtxWindow(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   return `${Math.round(tokens / 1000)}k`;
 }
-function ctxBar(percent: number, contextWindow?: number, autoCompact?: boolean): { text: string; color: string } {
+// Context-fill bar glyphs. `exact` = filled cells (fractional, 0..BAR_W). Each
+// style returns fill + track separately so renderers can color them
+// independently (fill = accent, track = grey). The bar bounds itself — no brackets.
+function barGlyphs(style: BarStyle, exact: number): { fill: string; track: string } {
+  const rest = (n: number, g: string) => g.repeat(Math.max(0, n));
+  switch (style) {
+    case "diamonds": // ◆ filled vs ◇ hollow
+    {
+      const full = Math.round(exact);
+      return { fill: "◆".repeat(full), track: rest(BAR_W - full, "◇") };
+    }
+    case "dots": // ● filled vs ○ hollow
+    {
+      const full = Math.round(exact);
+      return { fill: "●".repeat(full), track: rest(BAR_W - full, "○") };
+    }
+    case "shades": // ▓ fill, ▒ half, ░ track
+    {
+      const full = Math.floor(exact);
+      const edge = exact - full >= 0.5 ? "▒" : "";
+      return { fill: "▓".repeat(full) + edge, track: rest(BAR_W - full - edge.length, "░") };
+    }
+    case "blocks": // █ fill + 1/8-cell edge + ░ track
+    default: {
+      const full = Math.floor(exact);
+      const e = Math.round((exact - full) * 8);
+      if (e === 8) return { fill: "█".repeat(full + 1), track: rest(BAR_W - full - 1, "░") };
+      const edge = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][e];
+      return { fill: "█".repeat(full) + edge, track: rest(BAR_W - full - edge.length, "░") };
+    }
+  }
+}
+function ctxBar(percent: number, contextWindow?: number, autoCompact?: boolean): { fill: string; track: string; pctLabel: string; color: string } {
   const p = Math.max(0, Math.min(100, percent));
-  const filled = Math.round((p / 100) * BAR_W);
-  const bar = `[${"#".repeat(filled)}${"-".repeat(BAR_W - filled)}]`;
+  const style = BAR_STYLES.includes(cfg.barStyle as BarStyle) ? (cfg.barStyle as BarStyle) : "blocks";
+  const { fill, track } = barGlyphs(style, (p / 100) * BAR_W);
   const autoLabel = autoCompact ? " (auto)" : "";
   const pctLabel = contextWindow
     ? `${p.toFixed(1)}%/${formatCtxWindow(contextWindow)}${autoLabel}`
     : `${Math.round(p)}%${autoLabel}`;
-  const color = p > 90 ? "error" : p > 70 ? "warning" : "dim";
-  return { text: `${bar} ${pctLabel}`, color };
+  // Fill color name for theme.fg() renderers (footer): accent until the
+  // amber/red thresholds kick in. Raw-ANSI renderers use barFill() instead.
+  const color = p > 90 ? "error" : p > 70 ? "warning" : "accent";
+  return { fill, track, pctLabel, color };
 }
 
 function homeRel(cwd: string): string {
@@ -212,10 +254,32 @@ function glow(word: string, phase: number): string {
   return out;
 }
 
+// --- turn stats (Claude Code style) ----------------------------------------
+// While working: "(25s · ↓ 3.6k tokens)" appended to the working text.
+// On settle: "✷ Worked for 53s" dim status line under the turn.
+let turnStart: number | null = null; // first agent_start; survives auto-retry runs
+let settledTokens = 0; // output tokens of finalized assistant messages this turn
+let liveTokens = 0; // output tokens of the in-flight assistant message
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return `${n}`;
+}
+
+function turnStatsSuffix(): string {
+  if (!cfg.turnStats || turnStart == null) return "";
+  const s = Math.max(0, Math.floor((Date.now() - turnStart) / 1000));
+  const t = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${DIM_PRE} (${t} · ↓ ${fmtTokens(settledTokens + liveTokens)} tokens)${RST}`;
+}
+
 // sparkle spinner frames (rendered verbatim, so we add color).
 // Match the working text's base shade so star + word read as one.
 const RST = "\x1b[0m";
 let BASE_PRE = ""; // \x1b[38;2;r;g;bm for the palette base — set by applyPalette
+let DIM_PRE = ""; // dimmed palette base (turn-stats suffix) — set by applyPalette
 let SPIN: string[] = []; // colored spinner frames — set by applyPalette
 
 // header sweep animation state
@@ -227,6 +291,7 @@ let hdrComp: any; // captured header component ref for invalidate
 function applyPalette(): void {
   P = PALETTES[cfg.palette] || PALETTES.ember;
   BASE_PRE = `\x1b[38;2;${P.base[0]};${P.base[1]};${P.base[2]}m`;
+  DIM_PRE = `\x1b[38;2;${Math.round(P.base[0] * 0.55)};${Math.round(P.base[1] * 0.55)};${Math.round(P.base[2] * 0.55)}m`;
   SPIN = P.spinner.map((f) => `${BASE_PRE}${f}${RST}`);
   PROMPT = tc(P.prompt[0], P.prompt[1], P.prompt[2], P.promptChar);
   STAR = tc(P.prompt[0], P.prompt[1], P.prompt[2], P.star);
@@ -248,8 +313,16 @@ const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 let PROMPT = "";
 let STAR = "";
 const DIR_C: [number, number, number] = [150, 150, 150]; // dim grey (palette-agnostic)
-const barRgb = (p: number): [number, number, number] =>
-  p > 90 ? [248, 92, 92] : p > 70 ? [248, 163, 92] : DIR_C;
+// Bar FILL color: bright theme accent, amber above 70%, red above 90%. The
+// track stays DIR_C grey (painted by the render sites). `host.T` is the shared
+// theme proxy (live per render, follows palette switches); until loadHost()
+// resolves we fall back to the palette base RGB.
+const barFill = (p: number, fill: string): string => {
+  if (!fill) return "";
+  if (p > 90) return tc(248, 92, 92, fill);
+  if (p > 70) return tc(248, 163, 92, fill);
+  return host?.T?.fg ? host.T.fg("accent", fill) : tc(P.base[0], P.base[1], P.base[2], fill);
+};
 
 // Live status the box shows in its border rows. Set by the factory from ctx.
 interface BoxInfo {
@@ -445,8 +518,8 @@ class EmberEditor extends CustomEditor {
         const parts: string[] = [];
         if (bsOn("progress") || bsOn("percentage")) {
           const bar = ctxBar(info.percent);
-          const [r, g, b] = barRgb(info.percent);
-          parts.push(tc(r, g, b, bar.text));
+          // fill = accent (amber/red near full ctx), track + label = dim grey
+          parts.push(barFill(info.percent, bar.fill) + tc(DIR_C[0], DIR_C[1], DIR_C[2], `${bar.track} ${bar.pctLabel}`));
         }
         if (bsOn("cacheHits") && info.cacheHits > 0) {
           const fmt = info.cacheHits >= 1_000_000 ? `${(info.cacheHits / 1_000_000).toFixed(1)}M` : info.cacheHits >= 1_000 ? `${Math.round(info.cacheHits / 1000)}k` : `${info.cacheHits}`;
@@ -834,7 +907,7 @@ function captureInteractiveMode(): void {
 // Memoized deep-import of the host's internals. The package `exports` map only
 // exposes ".", so subpath imports must go by absolute file URL. Shared by the
 // thinking patch and the palette picker (both need pi-tui + the theme proxy).
-let host: { tui: any; T: any; themeMod: any; stackMod: any } | undefined;
+let host: { tui: any; T: any; themeMod: any; stackMod: any; syntMod: any } | undefined;
 let footerContainerRef: any = undefined; // captured from ctx during session_start
 let stackPatched = false;
 async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: any }> {
@@ -848,9 +921,10 @@ async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: 
   const tui: any = await import(url("node_modules/@earendil-works/pi-tui/dist/index.js"));
   const stackMod: any = await import(url("node_modules/@earendil-works/pi-tui/dist/components/stack.js"));
   const themeMod: any = await import(url("dist/modes/interactive/theme/theme.js"));
+  const syntMod: any = await import(url("dist/utils/syntax-highlight.js"));
   VW = tui.visibleWidth;
   TTW = tui.truncateToWidth;
-  host = { tui, T: themeMod.theme, themeMod, stackMod };
+  host = { tui, T: themeMod.theme, themeMod, stackMod, syntMod };
 
   // Patch allocateStackSizes once: when roundedBox is on and footer renders 0 lines,
   // override minSize for the footerContainer entry so it collapses to 0 instead
@@ -977,7 +1051,7 @@ async function patchThinking(): Promise<void> {
           ? ` thinking ${fmtDur(ms)} `
           : ` thought for ${fmtDur(ms)} `;
       const top = b("╭" + "─".repeat(Math.max(0, width - 2)) + "╮");
-      const bot = b("╰" + "─".repeat(Math.max(0, width - 3 - VW(title))) + title + "─╯");
+      const bot = b("╰" + "─".repeat(Math.max(0, width - 4 - VW(title))) + title + "──╯");
       return [top, ...padded, bot];
     }
   }
@@ -1137,6 +1211,59 @@ async function patchNotifications(): Promise<void> {
   };
 }
 
+// Signature-based language detection for UNLABELED fences. hljs v10's
+// highlightAuto misidentifies prose (English sentences come back "mipsasm")
+// and exposes no relevance score, so use explicit signatures for the
+// languages LLMs actually emit. First match wins; no match -> plain color.
+// ponytail: a wrong guess only costs slightly-off colors, never a crash.
+function detectLang(src: string): string | undefined {
+  const t = src.trim();
+  const head = src.slice(0, 2000); // signatures live near the top
+  if (t.startsWith("{") || t.startsWith("[")) {
+    try {
+      JSON.parse(t);
+      return "json"; // exact check, no false positives
+    } catch {
+      /* not json */
+    }
+  }
+  if (/<\?xml/.test(head)) return "xml";
+  if (/<\?php/.test(head)) return "php";
+  if (/^#!.*\bpython/.test(head)) return "python"; // covers /usr/bin/python3 and env python3
+  if (/^#!\s*\S*(node|deno|bun)\b/.test(head)) return "javascript";
+  if (/^#!/.test(head)) return "bash";
+  if (/#\s*include\s*</.test(head)) return "cpp";
+  // java BEFORE go: java's "package a.b;" would match go's bare "package x"
+  if (/^\s*package\s+[\w.]+;/m.test(head) || /\bpublic\s+(static\s+)?(void|class|final|int|String|boolean)\b/.test(head))
+    return "java";
+  if (/^\s{0,3}(package|func)\s+\w+/m.test(head)) return "go";
+  if (/\bfn\s+\w+\s*\(/.test(head) || /^\s*use\s+[\w:]+;/.test(head)) return "rust";
+  if (/\bnamespace\s+\w+/.test(head) || /\busing\s+System[.;]/.test(head)) return "csharp";
+  if (/\bdef\s+\w+\s*[\(:]/.test(head) || /^\s{0,3}from\s+[\w.]+\s+import\b/m.test(head)) return "python";
+  if (/^\s*(def|class)\s+[\w:]+(\s*\||\s*)$/m.test(head) && /\bend\b/m.test(head)) return "ruby";
+  if (/^\s*(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+(TABLE|VIEW|INDEX))\b/im.test(head)) return "sql";
+  if (/^\$\s+\S/m.test(head) || /\b(sudo|apt-get|pip3?|brew|cargo|chmod)\s+\w+/m.test(head)) return "bash";
+  if (/<(!DOCTYPE\s+html|html|head|body|div|span|meta|link|script|table|ul|ol|li|h[1-6])\b/i.test(head)) return "html";
+  if (/<\w+[^>]*>/.test(head)) return "xml";
+  if (
+    /\binterface\s+\w+/.test(head) ||
+    /\btype\s+\w+\s*=[^{]/.test(head) ||
+    /:\s*(string|number|boolean|void|never|unknown)\b/.test(head)
+  )
+    return "typescript";
+  if (
+    /\b(const|let|var)\s+\w+\s*=[^=]/.test(head) ||
+    /\bfunction\s+\w+\s*\(/.test(head) ||
+    /=>\s*{/.test(head) ||
+    /^\s*import\s+['"]|^\s*export\s+(default|const|function|class)/m.test(head)
+  )
+    return "javascript";
+  // yaml last: "key: value" lines are the weakest signature (object literals
+  // etc. must be claimed by the rules above first)
+  if ((head.match(/^[\t ]*[\w.-]+:/gm) || []).length >= 2 && !/[;{}=]/.test(head)) return "yaml";
+  return undefined;
+}
+
 // The host's Markdown component hardcodes literal ``` fence lines for code
 // blocks (only color/indent are themeable). Replace the "code" token branch
 // with a rounded box matching the extension's visual language.
@@ -1144,7 +1271,7 @@ let patchedCodeBlocks = false;
 async function patchCodeBlocks(): Promise<void> {
   if (patchedCodeBlocks) return;
   patchedCodeBlocks = true;
-  const { tui } = await loadHost();
+  const { tui, syntMod } = await loadHost();
   const MD = tui.Markdown;
   const orig = MD.prototype.renderToken;
   MD.prototype.renderToken = function (token: any, width: number, nextTokenType: string | undefined, styleContext: any) {
@@ -1153,13 +1280,18 @@ async function patchCodeBlocks(): Promise<void> {
     if (w < 10) return orig.call(this, token, width, nextTokenType, styleContext); // too narrow for a box
     const th = this.theme;
     const src: string = token.text ?? "";
+    // Explicit fence lang wins; only unlabeled fences get detected.
+    const lang: string | undefined = token.lang
+      ? syntMod.supportsLanguage(token.lang) || undefined
+      : detectLang(src);
     let body: string[] = th.highlightCode
-      ? th.highlightCode(src, token.lang)
+      ? th.highlightCode(src, lang)
       : src.split("\n").map((l: string) => th.codeBlock(l));
     if (body.length && body[body.length - 1] === "") body.pop(); // trailing newline guard
     body = body.flatMap((l) => (tui.visibleWidth(l) <= w - 4 ? [l] : tui.wrapTextWithAnsi(l, w - 4)));
     const border = (s: string) => th.codeBlockBorder(s);
-    const label = token.lang ? ` ${token.lang} ` : "";
+    const labelLang = token.lang ?? lang; // detected lang shows in the border too
+    const label = labelLang ? ` ${labelLang} ` : "";
     const L = tui.visibleWidth(label);
     if (w - 3 - L < 1) return orig.call(this, token, width, nextTokenType, styleContext); // label too long
     return [
@@ -1170,6 +1302,214 @@ async function patchCodeBlocks(): Promise<void> {
       ...(nextTokenType && nextTokenType !== "space" ? [""] : []),
     ];
   };
+}
+
+// ---- Mouse: click-to-place-cursor + right-click paste in the chat input ---
+// pi's TuiAltScreen consumes every mouse event itself: left clicks become
+// screen text-selection, wheel scrolls, right click (win32) pastes ANYWHERE
+// (handleRightClickPaste ignores x/y). The editor component never sees mouse
+// input, so there is no built-in way to click the input box to move the
+// cursor. We intercept both in the TuiAltScreen handlers:
+//  - left release over the editor box that was a plain click (no drag)
+//    -> translate (x,y) to (cursorLine, cursorCol) with the editor's OWN
+//    layout primitives (render/layoutText/buildVisualLineMap/segment) so
+//    wrapping, wide chars and paste markers match the on-screen text, then
+//    set the cursor. Press/drag stay native so highlight-to-copy in the
+//    input still works (host copies the selection on release; a zero-length
+//    selection copies nothing).
+//  - right press inside the editor box -> the host's clipboard paste, with
+//    the editor focused first so the paste lands in the input even if focus
+//    drifted. Outside the box: false (every downstream handler ignores the
+//    right button, so the click is a clean no-op).
+// Editor detection is by constructor name, NOT instanceof: the extension's bare
+// import resolves to %USERPROFILE%\\node_modules (a SECOND pi-coding-agent copy),
+// while the running host uses the %APPDATA%\\npm copy — cross-copy instanceof
+// would never match the host's editor.
+
+// The layout box tree only descends through VStack/ScrollView nodes — a
+// Container (which wraps the editor slot) is a LEAF box (children: []) that
+// renders its whole subtree at once. So to find the editor we probe each leaf
+// box's COMPONENT subtree: if it contains an editor, recompute child rects
+// from rendered row counts (Container.render concatenates children's rows
+// with no gaps, so offsets are cumulative heights).
+function hasEditorDescendant(comp: any): boolean {
+  if (!comp) return false;
+  if (/Editor$/.test(comp.constructor?.name ?? "")) return true; // EmberEditor, host CustomEditor/Editor — any copy
+  const kids = Array.isArray(comp.children) ? comp.children : [];
+  for (const k of kids) if (hasEditorDescendant(k)) return true;
+  return false;
+}
+
+// Hit-test (x, y) against a component subtree rendered at rect.x/y/width.
+function probeEditorAt(comp: any, x: number, y: number, rect: { x: number; y: number; width: number }, depth = 0): { comp: any; rect: any } | undefined {
+  if (!comp || depth > 4) return undefined;
+  if (/Editor$/.test(comp.constructor?.name ?? "")) {
+    if (x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height) return { comp, rect };
+    return undefined;
+  }
+  const kids = Array.isArray(comp.children) ? comp.children : [];
+  if (!kids.length) return undefined;
+  let yOff = rect.y;
+  for (const kid of kids) {
+    let h = 0;
+    try { h = kid.render(rect.width).length; } catch { h = 0; }
+    const hit = probeEditorAt(kid, x, y, { x: rect.x, y: yOff, width: rect.width, height: h }, depth + 1);
+    if (hit) return hit;
+    yOff += h;
+  }
+  return undefined;
+}
+
+// Find the editor under (x, y) -> { comp, rect } (screen coords) | undefined.
+function findEditorBoxAt(tui: any, x: number, y: number): { comp: any; rect: any } | undefined {
+  let found: { comp: any; rect: any } | undefined;
+  const visit = (box: any) => {
+    if (found || !box) return;
+    const r = box.rect;
+    if (r && hasEditorDescendant(box.component)) {
+      // box.lineOffset shifts painted rows down when the box is height-clamped;
+      // lift the virtual origin so screen coords line up with child rows.
+      const lo = box.lineOffset ?? 0;
+      found = probeEditorAt(box.component, x, y, { x: r.x, y: r.y - lo, width: r.width });
+    }
+    for (const c of box.children || []) visit(c);
+  };
+  const root = tui?.currentLayout?.root;
+  if (root) visit(root);
+  return found;
+}
+
+// Border-ish rows of the editor box (plain ── lines, rounded corners, scroll
+// indicators). Content rows are the contiguous run after row 0 that matches
+// none of these; rows after the bottom border are the autocomplete list.
+// Content rows are always safe from false positives: rounded mode wraps them
+// in │/❯, plain mode indents them by paddingX ≥ 2 spaces.
+const ED_BORDER_RE = /^─+$|^╰.*╯$|^─+\s*[↑↓]\s*\d+\s+more/;
+const edRowIsBorder = (s: string): boolean => ED_BORDER_RE.test(stripAnsi(s));
+
+// Visible column -> string offset in a plain text line, using the editor's own
+// grapheme segmentation (the same input wordWrapLine gets, so it matches the
+// wrapping exactly). A click on either half of a wide char lands before it.
+function colToOffset(ed: any, text: string, col: number): number {
+  let w = 0;
+  let off = 0;
+  for (const seg of ed.segment(text, "grapheme")) {
+    const s: string = seg.segment;
+    const gw = VW(s);
+    if (col === w) return off;
+    if (col < w + gw) return gw === 1 ? off + s.length : off;
+    w += gw;
+    off += s.length;
+  }
+  return off;
+}
+
+// Box-local click -> { kind: "cursor", line, col } | { kind: "border" } |
+// { kind: "pass" } (autocomplete row: keep host behavior) | null (bail: let
+// the host handle it). Re-renders the editor at its box width for the exact
+// on-screen rows; render() only adjusts scrollOffset to keep the cursor
+// visible, which is a no-op right after a real render.
+function editorClickTarget(ed: any, rect: { x: number; y: number; width: number }, x: number, y: number): any {
+  const width = rect?.width;
+  if (!width) return null;
+  let rows: string[];
+  try {
+    rows = ed.render(width);
+  } catch {
+    return null;
+  }
+  const r = y - rect.y;
+  const c = x - rect.x;
+  if (r < 0 || r >= rows.length || c < 0) return null; // out of box -> host
+  if (r === 0) return { kind: "border" }; // top border / scroll indicator
+  // Find the bottom border: first border row after the content run starts.
+  let k = 1;
+  while (k < rows.length && !edRowIsBorder(rows[k])) k++;
+  if (r >= k) {
+    return r === k ? { kind: "border" } : { kind: "pass" }; // bottom border / autocomplete list
+  }
+  const layoutIdx = (ed.scrollOffset ?? 0) + (r - 1);
+  const padX = Math.min(ed.paddingX ?? 0, Math.max(0, Math.floor((width - 1) / 2)));
+  const W = ed.lastWidth ?? Math.max(1, width - 2 * padX);
+  const ll = ed.layoutText(W)[layoutIdx];
+  if (!ll) return { kind: "border" }; // ponytail: layout drift -> no-op
+  const strOffset = colToOffset(ed, ll.text, Math.max(0, c - padX));
+  const vl = ed.buildVisualLineMap(W)[layoutIdx];
+  if (!vl) return { kind: "cursor", line: 0, col: 0 };
+  const lineLen = (ed.state.lines[vl.logicalLine] || "").length;
+  return {
+    kind: "cursor",
+    line: vl.logicalLine,
+    col: Math.max(0, Math.min(vl.startCol + strOffset, lineLen)),
+  };
+}
+
+let patchedEditorMouse = false;
+async function patchEditorMouse(): Promise<void> {
+  if (patchedEditorMouse) return;
+  patchedEditorMouse = true;
+  try {
+    const { tui } = await loadHost();
+    const proto = tui.TuiAltScreen?.prototype;
+    if (!proto) return;
+
+    // Left release over the editor that was a plain click (no drag) -> move
+    // the cursor. Press/drag/release are otherwise fully native: the host
+    // sets its selection anchor on press, extends it on drag, and copies to
+    // the clipboard on release — so highlight-to-copy in the input still
+    // works (a zero-length selection copies nothing, verified in
+    // getSelectionBounds: anchor==focus -> undefined -> early return).
+    const origSelect = proto.handleSelectionMouseEvent;
+    if (typeof origSelect === "function") {
+      proto.handleSelectionMouseEvent = function (event: any) {
+        try {
+          if (event && event.release && (event.button & 3) === 0 && !this.hasOverlay?.()) {
+            const wasPress = !!this.selectionPressActive;
+            const dragged = !!this.selectionDragged;
+            const out = origSelect.call(this, event); // finalize native selection (copies if dragged)
+            // A true click: press+release without drag, and the host ended
+            // with a zero-length selection (covers press-elsewhere-release-here
+            // edge: non-zero bounds -> skip).
+            if (wasPress && !dragged && !this.getSelectionBounds?.()) {
+              const box = findEditorBoxAt(this, event.x, event.y);
+              if (box) {
+                const t = editorClickTarget(box.comp, box.rect, event.x, event.y);
+                if (t?.kind === "cursor") {
+                  if (this.getFocusedComponent?.() !== box.comp) this.setFocus?.(box.comp);
+                  box.comp.state.cursorLine = t.line;
+                  box.comp.setCursorCol(t.col); // also clears sticky visual column
+                  this.requestRender?.();
+                }
+                // border/pass -> no-op (host already no-op'd a zero-length selection)
+              }
+            }
+            return out;
+          }
+          return origSelect.call(this, event);
+        } catch {
+          return false;
+        }
+      };
+    }
+
+    // Right press over the editor -> host clipboard paste (focus first so it
+    // lands in the input). Outside the editor: no paste (the win32 shortcut is
+    // otherwise screen-wide).
+    const origRight = proto.handleRightClickPaste;
+    if (typeof origRight === "function") {
+      proto.handleRightClickPaste = function (event: any) {
+        try {
+          if (!event || event.release || event.button !== 2) return origRight.call(this, event);
+          const box = findEditorBoxAt(this, event.x, event.y);
+          if (!box) return false; // outside the editor -> clean no-op
+          if (this.getFocusedComponent?.() !== box.comp) this.setFocus?.(box.comp);
+          return origRight.call(this, event);
+        } catch {
+          return false;
+        }
+      };
+    }
+  } catch { /* host internals unavailable -> no mouse niceties */ }
 }
 
 // Live preview: swap brand RGB + pair the pi theme. setTheme triggers a full
@@ -1224,12 +1564,73 @@ async function pickPalette(ctx: any): Promise<void> {
   }
 }
 
+// Pass-through component: renders a live preview line above a SelectList and
+// forwards input to it. Lets the picker show what the hovered style looks like
+// at the REAL ctx % (the editor border is not visible while a non-overlay
+// picker occupies the editor slot).
+class BarStylePreviewList {
+  constructor(private list: any, private previewLine: () => string) {}
+  render(width: number): string[] {
+    return [this.previewLine(), ...this.list.render(width)];
+  }
+  handleInput(data: string): void {
+    this.list.handleInput(data);
+  }
+  invalidate(): void {
+    this.list.invalidate();
+  }
+  dispose(): void {
+    this.list.dispose?.();
+  }
+}
+
+// Bar-style picker with LIVE preview. Non-overlay: it takes the editor slot,
+// exactly where the /status-bar menu just was. Hovering a style updates
+// cfg.barStyle; the preview line (re-read every render pass) shows that style
+// at the real ctx % in the real threshold color. Each row also carries a
+// sample bar at 65% so every style is visible at a glance. Enter commits,
+// Esc reverts the preview (the restored editor re-bakes its border from cfg).
+async function pickBarStyle(ctx: any): Promise<void> {
+  const { tui, themeMod } = await loadHost();
+  const { SelectList } = tui;
+  const original: BarStyle = BAR_STYLES.includes(cfg.barStyle as BarStyle) ? (cfg.barStyle as BarStyle) : "blocks";
+  const items = BAR_STYLES.map((s) => {
+    const g = barGlyphs(s, 0.65 * BAR_W); // sample bar at 65% + name
+    return { value: s, label: `${g.fill}${g.track}  ${s}`, description: s === original ? "current" : undefined };
+  });
+  const previewLine = () => {
+    const p = ctx.getContextUsage?.()?.percent ?? 0;
+    const style: BarStyle = BAR_STYLES.includes(cfg.barStyle as BarStyle) ? (cfg.barStyle as BarStyle) : "blocks";
+    const g = barGlyphs(style, (p / 100) * BAR_W);
+    // live preview: hovered style at real ctx %, accent fill + grey track
+    return `  ${barFill(p, g.fill)}${tc(DIR_C[0], DIR_C[1], DIR_C[2], g.track)}${DIM_PRE} ${Math.round(p)}% of context${RST}`;
+  };
+  const chosen: string | undefined = await ctx.ui.custom(
+    (_tui: any, _theme: any, _kb: any, done: (v: string | undefined) => void) => {
+      const list = new SelectList(items, 8, themeMod.getSelectListTheme());
+      list.setSelectedIndex(Math.max(0, BAR_STYLES.indexOf(original)));
+      list.onSelectionChange = (it: any) => { cfg.barStyle = it.value; }; // preview line reads it live
+      list.onSelect = (it: any) => done(it.value);
+      list.onCancel = () => done(undefined);
+      return new BarStylePreviewList(list, previewLine);
+    },
+  );
+  if (chosen && BAR_STYLES.includes(chosen as BarStyle)) {
+    cfg.barStyle = chosen;
+    saveCfg();
+    ctx.ui.notify(`Bar style: ${chosen}`);
+  } else {
+    cfg.barStyle = original; // Esc -> revert preview
+  }
+}
+
 // Toggle table drives both the menu and persistence.
 const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void; apply?: (ctx: any) => void }[] = [
   { name: "Rounded input box", get: () => cfg.roundedBox, set: (v) => (cfg.roundedBox = v) },
   { name: "❯ prompt char", get: () => cfg.promptChar, set: (v) => (cfg.promptChar = v) },
   { name: "Glowing working text", get: () => cfg.glowText, set: (v) => (cfg.glowText = v) },
   { name: "Sparkle spinner", get: () => cfg.sparkleSpinner, set: (v) => (cfg.sparkleSpinner = v) },
+  { name: "Turn stats (elapsed/tokens)", get: () => cfg.turnStats, set: (v) => (cfg.turnStats = v) },
   { name: "Live thinking box", get: () => cfg.thinkBox, set: (v) => (cfg.thinkBox = v) },
   { name: "Collapse thinking", get: () => cfg.collapseThinking, set: (v) => (cfg.collapseThinking = v), apply: (ctx: any) => rebuildLiveMessages() },
   { name: "Custom header", get: () => cfg.customHeader, set: (v) => (cfg.customHeader = v) },
@@ -1268,6 +1669,7 @@ export default function (pi: ExtensionAPI) {
       }); // ember-box the inline thinking trace
       patchNotifications().catch(() => {}); // recolor package-update line on palette change
       patchCodeBlocks().catch(() => {}); // rounded boxes for markdown code blocks
+      patchEditorMouse().catch(() => {}); // click-to-place-cursor + right-click paste in the chat input
     }, 0);
 
     // Status lives in the box border. Footer is hidden when roundedBox is on
@@ -1285,16 +1687,23 @@ export default function (pi: ExtensionAPI) {
 
         const parts: string[] = [];
         if (bsOn("path")) parts.push(homeRel(cwd) + (branch ? ` (${branch})` : ""));
-        if (bsOn("progress") || bsOn("percentage")) parts.push(bar.text);
+        const hasBar = bsOn("progress") || bsOn("percentage");
+        if (hasBar) parts.push(`${bar.fill}${bar.track} ${bar.pctLabel}`);
         if (bsOn("model")) parts.push(model);
         if (parts.length === 0) return [];
 
-        const left = parts[0];
-        const right = parts.slice(1).join("  ");
-        const gap = right ? Math.max(2, width - left.length - right.length - 4) : 0;
+        // The bar keeps its own split colors (accent fill, grey track/label);
+        // every other right-side part is dim. Gap math uses plain lengths.
+        const rightRaw = parts.slice(1);
+        const right = rightRaw
+          .map((s, i) => (i === 0 && hasBar
+            ? theme.fg(bar.color, bar.fill) + theme.fg("dim", bar.track + ` ${bar.pctLabel}`)
+            : theme.fg("dim", s)))
+          .join("  ");
+        const gap = rightRaw.length ? Math.max(2, width - parts[0].length - rightRaw.join("  ").length - 4) : 0;
         return [
-          theme.fg("dim", left) +
-            (right ? " ".repeat(gap) + theme.fg(bar.color, right) : "") +
+          theme.fg("dim", parts[0]) +
+            (right ? " ".repeat(gap) + right : "") +
             theme.fg("accent", "✷") +
             " ",
         ];
@@ -1302,9 +1711,32 @@ export default function (pi: ExtensionAPI) {
     }));
   });
 
+  // Output-token accounting. usage.output updates per stream delta on providers
+  // that report it live (Anthropic); others fill it in at message end — the
+  // counter still lands correctly, just jumps instead of ticking.
+  pi.on("message_start", (e) => {
+    if (e.message.role === "assistant") liveTokens = 0;
+  });
+  pi.on("message_update", (e) => {
+    if (e.message.role === "assistant") liveTokens = e.message.usage?.output ?? 0;
+  });
+  pi.on("message_end", (e) => {
+    if (e.message.role === "assistant") {
+      settledTokens += e.message.usage?.output ?? 0;
+      liveTokens = 0;
+    }
+  });
+
   pi.on("agent_start", (_e, ctx) => {
+    if (turnStart == null) turnStart = Date.now(); // keep first start across auto-retry runs
     ctx.ui.setWorkingIndicator(cfg.sparkleSpinner ? { frames: SPIN, intervalMs: 120 } : undefined);
-    if (!cfg.glowText) return; // plain default "Working..." message
+    if (!cfg.glowText) {
+      if (!cfg.turnStats) return; // plain default "Working..." message
+      glowTimer = setInterval(() => {
+        ctx.ui.setWorkingMessage(BASE_PRE + "Working" + RST + turnStatsSuffix());
+      }, 1000); // 1s resolution is all the stats clock needs
+      return;
+    }
 
     const word = WORDS[Math.floor(Math.random() * WORDS.length)]; // pick per turn
     let phase = -CREST_SPAN; // crest enters from the left edge
@@ -1313,9 +1745,9 @@ export default function (pi: ExtensionAPI) {
     glowTimer = setInterval(() => {
       phase += 0.5;
       if (phase > word.length + CREST_SPAN) phase = -CREST_SPAN; // loop crest
-      const dots = ".".repeat(Math.floor(tick / DOT_EVERY) % 4); // . .. ... cycle
+      const dots = ".".repeat(Math.floor(tick / DOT_EVERY) % 4).padEnd(3); // . .. ... cycle, padded so the stats suffix stays in a fixed column
       tick++;
-      ctx.ui.setWorkingMessage(glow(word, phase) + BASE_PRE + dots + RST);
+      ctx.ui.setWorkingMessage(glow(word, phase) + BASE_PRE + dots + RST + turnStatsSuffix());
     }, GLOW_TICK_MS);
   });
 
@@ -1328,9 +1760,29 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWorkingIndicator(); // restore default spinner
   });
 
+  // Turn fully finished (no auto-retry/queued continuation pending). The final
+  // message is already in the chat at this point, so the status line lands
+  // right under the turn.
+  pi.on("agent_settled", (_e, ctx) => {
+    const start = turnStart;
+    turnStart = null;
+    settledTokens = 0;
+    liveTokens = 0;
+    if (start == null || !cfg.turnStats || ctx.mode !== "tui") return;
+    const im = interactiveModeInstance;
+    if (!im?.chatContainer) return;
+    const s = Math.max(1, Math.round((Date.now() - start) / 1000));
+    const dur = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+    // showStatus bakes theme.fg("dim"); the star's embedded ANSI overrides it.
+    im.showStatus(STAR + ` Worked for ${dur}`);
+  });
+
   pi.on("session_shutdown", () => {
     footerContainerRef = undefined;
     borderCtx = undefined;
+    turnStart = null;
+    settledTokens = 0;
+    liveTokens = 0;
     if (borderCacheTimer) { clearInterval(borderCacheTimer); borderCacheTimer = null; }
   });
 
@@ -1365,7 +1817,7 @@ export default function (pi: ExtensionAPI) {
 
   // /status-bar — configure border status elements
   pi.registerCommand("status-bar", {
-    description: "Toggle border status elements (progress, percentage, path, model)",
+    description: "Toggle border status elements + bar style",
     handler: async (_args: string, ctx: any) => {
       if (ctx.mode !== "tui") return;
       // Ensure borderStatus is an object (upgrade from legacy true)
@@ -1378,6 +1830,7 @@ export default function (pi: ExtensionAPI) {
           `${bs.model ? "[x]" : "[ ]"} Model name          (top)`,
           `${bs.progress ? "[x]" : "[ ]"} Progress bar        (bottom)`,
           `${bs.percentage ? "[x]" : "[ ]"} Percentage          (bottom)`,
+          `Bar style: ${cfg.barStyle}`,
           `${bs.cacheHits ? "[x]" : "[ ]"} Cache hits          (bottom)`,
           `${bs.path ? "[x]" : "[ ]"} Path                (bottom)`,
           `${bs.branch ? "[x]" : "[ ]"} Git branch          (bottom)`,
@@ -1386,6 +1839,10 @@ export default function (pi: ExtensionAPI) {
         ];
         const choice = await ctx.ui.select("Status bar elements", opts);
         if (!choice || choice === "Close") break;
+        if (choice.startsWith("Bar style")) {
+          await pickBarStyle(ctx); // live preview picker (overlay)
+          continue;
+        }
         if (choice.includes("Model")) bs.model = !bs.model;
         else if (choice.includes("Progress")) bs.progress = !bs.progress;
         else if (choice.includes("Percentage")) bs.percentage = !bs.percentage;

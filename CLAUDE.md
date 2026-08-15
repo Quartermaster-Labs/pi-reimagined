@@ -29,7 +29,19 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 - **Rounded input box** — `EmberEditor extends CustomEditor`, decorates rendered rows
   (corners, side `│`, prompt `❯`, status baked into border). Border status is
   granular: model name (top), progress bar + percentage + path + branch + cache hits
-  + diff stats (bottom), each independently toggleable via `/status-bar`. Ctrl+C
+  + diff stats (bottom), each independently toggleable via `/status-bar`. The ctx-fill
+  bar has 4 glyph styles (`cfg.barStyle`, picked in `/status-bar`): blocks (█ + 1/8-cell
+  edge + ░, default), diamonds (◆◇), dots (●○), shades (▓▒░). Two-color render:
+  fill = bright theme accent (amber >70%, red >90% — `barFill()`), track + pct label =
+  dim grey; the accent reads live from the shared theme proxy (`host.T.fg("accent")`)
+  so palette switches recolor it. (A braille style was tried and dropped — its ⠸
+  dotted track read as noise.) The picker is a NON-overlay `BarStylePreviewList` (pass-through
+  Component: preview line + `SelectList`) that takes the editor slot — exactly where
+  the /status-bar menu just was (overlays composite over the whole screen incl. editor
+  rows, so a bottom anchor would cover the box). Each row shows a sample bar at 65%,
+  and the top preview line re-reads `cfg.barStyle` per render: hovering a style
+  previews it at the REAL ctx % in the real threshold color (the border itself is
+  invisible while the picker occupies the slot). Ctrl+C
   double-press exits (first press shows italic warning for 500ms). Scrolling handled by
   TuiAltScreen's ScrollView, not manual scrollOffset.
 - **Custom header** — `ctx.ui.setHeader(factory)`; `PI` block letters with a vertical
@@ -52,26 +64,91 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
   wrapped via `wrapTextWithAnsi` to width-4). Falls back to the host branch when the width is
   < 10 or the lang label overflows. Border/content colors still come from the instance's
   markdown theme (`codeBlockBorder`/`codeBlock`/`highlightCode`), so palettes apply for free.
+  - **Syntax highlighting + language detection.** Highlighting was already wired: the host's
+    `highlightCode` (dist/utils/syntax-highlight.js, highlight.js v10 + palette-derived theme)
+    is called with the effective lang. UNLABELED fences get a conservative `detectLang()`
+    signature match (json via JSON.parse, shebangs, per-language regexes; ordered specific →
+    general, yaml last). NO `hljs.highlightAuto` — it misidentifies prose ("mipsasm") and v10
+    exposes no relevance score. A detected lang is used for both highlighting and the border
+    label. Detection is per-render (cheap regexes on the first 2KB); no cache — the host
+    itself re-highlights every frame. Wrong guess = slightly-off colors only.
 - **Update-notification recolor** — monkeypatches both `showNewVersionNotification` and
   `showPackageUpdateNotification`: the host bakes `theme.fg("warning", …)` (amber in every
   palette) into one-shot `Text` children that `rebuildLiveMessages()` never touches. Both are
   rewritten with live `LiveText` bodies + `DynamicBorder` accent borders that re-read the shared
   theme proxy per render, so the boxes follow the active palette. (Version box drops OSC8
   hyperlink + Markdown note rendering — ponytail: URL stays visible as text.)
+- **Mouse in the chat input** — `TuiAltScreen` consumes every mouse event itself
+  (left = screen selection, wheel = scroll, right = win32 paste anywhere, ignores
+  x/y); the editor component never sees mouse input. `patchEditorMouse()` patches
+  two TuiAltScreen prototypes:
+  - `handleSelectionMouseEvent`: plain left **release** over the editor box that was a
+    true click → click-to-place-cursor. True click = `selectionPressActive` on
+    release, `selectionDragged` false, AND `getSelectionBounds()` empty (covers
+    press-elsewhere-release-here). Press/drag/release are otherwise fully native —
+    the host anchors on press, extends on drag, and copies the selection on release,
+    so **highlight-to-copy in the input still works** (a zero-length selection copies
+    nothing: `getSelectionBounds` returns undefined when anchor==focus, so the
+    clipboard is never clobbered by a plain click). `editorClickTarget()` maps (x,y)
+    → (cursorLine, cursorCol) using the editor's OWN layout primitives so wrapping,
+    wide chars and paste markers match the on-screen text: `ed.render(width)` for
+    the exact rows (render() only re-adjusts scrollOffset, a no-op right after a
+    real render), `layoutText(W)` for the row text, `buildVisualLineMap(W)` for
+    visual→logical line, `segment(text,"grapheme")` for col→string offset (W =
+    `ed.lastWidth`; padX = `min(paddingX, floor((width-1)/2))`). Rows: 0 = top
+    border (no-op), content run = cursor, first border row after the run = bottom
+    border (no-op), rows after = autocomplete list (falls through to host
+    selection). Skipped while `hasOverlay()`. The click also `setFocus`es the
+    editor if focus drifted.
+  - `handleRightClickPaste`: right press inside the editor box → host clipboard paste,
+    with `setFocus(editor)` first so the paste lands in the input (the host's
+    `onRightClickPaste` injects bracketed paste into `getFocusedComponent()`). Outside
+    the box return false — downstream handlers (scrollbar/selection) ignore the right
+    button, so the click is a clean no-op.
+  Editor box detection (`findEditorBoxAt`): hit-test the layout box tree
+  (`currentLayout.root`, boxes carry `component` + `rect` + `children`). CRITICAL:
+  the tree only descends through VStack/ScrollView nodes — a `Container` (the host
+  wraps the editor slot in one) is a LEAF box (children: []) that renders its whole
+  subtree at once, so the editor never appears as its own box. Each leaf box's
+  COMPONENT subtree is therefore probed (`hasEditorDescendant` name check, then
+  `probeEditorAt` recomputes child rects from rendered row counts —
+  `Container.render` concatenates children's rows with no gaps, offsets are
+  cumulative heights; `box.lineOffset` shifts the virtual origin for
+  height-clamped boxes). Matched by constructor name `/Editor$/` (EmberEditor, host
+  CustomEditor/Editor).
+  **Name match, not `instanceof`**: the extension's bare imports resolve to
+  `%USERPROFILE%\node_modules\@earendil-works\pi-coding-agent` — a SECOND copy — while the
+  running host uses the `%APPDATA%\npm` one that `loadHost()` patches. Cross-copy
+  `instanceof` never matches (class identity verified FALSE). Duck-type by name/shape
+  whenever you need to recognize host classes.
+  Regression harness: `node test-mouse.mjs` — drives the real host `Editor` (from the
+  `%APPDATA%\npm` pi-tui copy) through the extracted `findEditorBoxAt` +
+  `editorClickTarget` (fake frame: VStack root → leaf Container box holding the
+  editor) for wrapping, CJK wide chars, `scrollOffset`, the rounded box, and
+  container probing (spacer sibling, nested container). `node --check pi-reimagined.ts`
+  is the TS syntax gate.
 - **Loaded resources hidden** — monkeypatches `InteractiveMode.prototype.showLoadedResources`
   to clear the startup Context/Extensions/Themes info block (still accessible via ctrl+o).
 - **Glow text** — `agent_start` picks a random fun word ("Bamboozling", "Smelting", …)
   and animates a per-char glow sweep (crest traveling left→right) via `setWorkingMessage`.
 - **Sparkle spinner** — `setWorkingIndicator` with palette-specific frames (e.g. dots
   coalescing into a star for void).
+- **Turn stats (Claude Code style)** — `agent_start` records turn start (kept across
+  auto-retry runs; only reset on `agent_settled`), `message_update` tracks the in-flight
+  `usage.output`, `message_end` banks it into the turn total. The working text gets a
+  dimmed `(25s · ↓ 3.6k tokens)` suffix in both glow and plain modes. On `agent_settled`
+  the final message is already in the chat, so the host's own `showStatus()` (dim line +
+  spacer, dedupes back-to-back statuses) adds "✷ Worked for 53s" right under the turn.
+  Toggle: `/pi-reimagined > Turn stats`.
 - **Footer** — custom `setFooter` single-line status bar (path, progress, model). Hidden
   (returns empty) when `roundedBox` is on; `allocateStackSizes` is patched to force
   footer minSize to 0 so no blank line leaks.
 - **Scrollbar** — `scrollbarStyle` set to palette base RGB; `wheelScrollLines` boosted to 3.
 - **Config** — `~/.pi/agent/pi-reimagined.config.json` (feature toggles + palette +
-  granular `BorderStatus`). `BorderStatus` is either `true` (all defaults) or a partial
+  granular `BorderStatus` + `barStyle`). `BorderStatus` is either `true` (all defaults) or a partial
   object with per-element bools (model, progress, percentage, path, branch, cacheHits,
-  diffStats). Runtime state, gitignored, not part of source.
+  diffStats). `barStyle` ∈ blocks/diamonds/dots/shades (invalid values fall
+  back to blocks). Runtime state, gitignored, not part of source.
 
 ## Key host facts (learned the hard way)
 
@@ -116,7 +193,8 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
 - `/pi-reimagined` — toggle features (rounded box, prompt char, glow text, sparkle
   spinner, think box, collapse thinking, custom header) + open palette picker
 - `/status-bar` — toggle individual border status elements (model, progress bar,
-  percentage, cache hits, path, git branch, diff stats)
+  percentage, cache hits, path, git branch, diff stats) + open the bar-style picker
+  (live hover preview in the border)
 
 ## Testing
 
