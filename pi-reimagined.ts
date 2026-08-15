@@ -327,6 +327,7 @@ const barFill = (p: number, fill: string): string => {
 // Live status the box shows in its border rows. Set by the factory from ctx.
 interface BoxInfo {
   model: string;
+  thinkingLevel?: string;
   percent: number;
   contextWindow: number;
   dir: string;
@@ -507,10 +508,17 @@ class EmberEditor extends CustomEditor {
     // Right label: model name (account for left scroll label when present)
     const availForRight = leftScrollLen > 0 ? budget - leftScrollLen - 1 : budget;
     if (info && bsOn("model")) {
-      const starRoom = VW(" " + STAR);
-      const model = this.fitTail(info.model, Math.max(0, availForRight - starRoom));
-      topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
-      topLen = VW(topLabel);
+      if (info.thinkingLevel) {
+        // effort level is the label terminator -> no trailing star (avoids "… ○ xhigh ○")
+        const model = this.fitTail(info.model + ` ○ ${info.thinkingLevel}`, Math.max(0, availForRight));
+        topLabel = tc(P.base[0], P.base[1], P.base[2], model);
+        topLen = VW(topLabel);
+      } else {
+        const starRoom = VW(" " + STAR);
+        const model = this.fitTail(info.model, Math.max(0, availForRight - starRoom));
+        topLabel = tc(P.base[0], P.base[1], P.base[2], model) + " " + STAR;
+        topLen = VW(topLabel);
+      }
     }
 
       // Bottom label: progress bar + percentage + path + branch + cacheHits + diffStats (each optional)
@@ -637,8 +645,11 @@ function makeEditor(ctx: any) {
     ed.getInfo = () => {
       const u = ctx.getContextUsage?.();
       const cwd = ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? "";
+      const tl = ctx.thinkingLevel;
       return {
         model: ctx.model?.id || "no-model",
+        // show effort only when the model supports thinking and it's turned on
+        thinkingLevel: ctx.model?.reasoning && tl && tl !== "off" ? tl : undefined,
         percent: u && u.percent != null ? u.percent : 0,
         contextWindow: u?.contextWindow ?? 0,
         dir: homeRel(cwd),
