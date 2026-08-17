@@ -20,8 +20,14 @@ Toggle any feature or switch palette via `/pi-reimagined`; configure border stat
 
 ## Install
 
-Copy `pi-reimagined.ts` into your pi extensions dir and the four `themes/*.json`
-into your pi themes dir:
+Via pi (recommended):
+
+```
+pi install npm:pi-reimagined
+```
+
+Or manually: copy `pi-reimagined.ts` into your pi extensions dir and the four
+`themes/*.json` into your pi themes dir:
 
 ```
 ~/.pi/agent/extensions/pi-reimagined.ts
@@ -29,6 +35,8 @@ into your pi themes dir:
 ```
 
 Restart pi. Run `/pi-reimagined` to configure.
+
+Requires Node >= 22.19 (same as pi).
 
 ## Palettes
 

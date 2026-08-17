@@ -10,6 +10,11 @@ not Claude Code. Extensions are TypeScript exporting `export default function (p
 
 Live install lives at `~/.pi/agent/` (`extensions/pi-reimagined.ts`, `themes/*.json`).
 This repo is the publishable copy. Edits here must be mirrored to the live dir to test.
+package.json carries the `pi` manifest (`extensions: ./pi-reimagined.ts`,
+`themes: ./themes`) — required for `pi install` discovery: package installs without
+a manifest only pick up convention dirs (`extensions/`, `themes/`, …), so the
+root-level `.ts` would be skipped. GOTCHA: once a manifest exists, resource types
+you omit are DROPPED entirely, so both extensions and themes must stay listed.
 
 ## Architecture
 

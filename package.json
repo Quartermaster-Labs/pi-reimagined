@@ -14,8 +14,23 @@
     "coding-agent",
     "tui",
     "extension",
-    "theme"
+    "theme",
+    "pi-package"
   ],
+  "pi": {
+    "extensions": [
+      "./pi-reimagined.ts"
+    ],
+    "themes": [
+      "./themes"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "author": "radu0120",
   "license": "MIT",
   "repository": {
