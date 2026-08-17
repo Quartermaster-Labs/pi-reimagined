@@ -237,8 +237,6 @@ const tc = (r: number, g: number, b: number, s: string) =>
 // time before session_start's loadHost() resolves.
 // ponytail: fallback assumes 1 unit = 1 col; only wrong if a render fires that early.
 let VW: (s: string) => number = (s) => s.length;
-let TTW: (s: string, max: number, ellipsis?: string, pad?: boolean) => string = (s, max) =>
-  s.length <= max ? s : max <= 0 ? "" : s.slice(0, Math.max(0, max - 1)) + "…";
 
 function glow(word: string, phase: number): string {
   let out = "";
@@ -800,76 +798,11 @@ function applyHeader(ctx: any): void {
 // (the component that already renders the inline thinking block) so its thinking
 // trace is drawn inside our rounded ember box. Live, in-place, context untouched.
 
-// Inline markdown-lite: italic body in theme thinkingText (matches the built-in
-// thinking block), `code` spans recolored to accent. Applied AFTER padding so
-// the embedded ANSI never throws off column math.
-function thinkInline(line: string, theme: any): string {
-  return line
-    .split(/(`[^`]*`)/)
-    .map((p) =>
-      p.length >= 2 && p.startsWith("`") && p.endsWith("`")
-        ? theme.italic(theme.fg("accent", p.slice(1, -1)))
-        : theme.italic(theme.fg("thinkingText", p)),
-    )
-    .join("");
-}
-
-// Word-wrap to width w. Drops blank lines; only hard-splits words longer than w.
-function wrap(text: string, w: number): string[] {
-  const out: string[] = [];
-  for (const para of text.split("\n")) {
-    const words = para.split(/\s+/).filter(Boolean);
-    if (!words.length) continue; // skip blank lines
-    let line = "";
-    for (let word of words) {
-      while (VW(word) > w) {
-        // overlong token (e.g. a path) -> hard-break the overflow
-        if (line) {
-          out.push(line);
-          line = "";
-        }
-        const head = TTW(word, w, ""); // no ellipsis -- this is a raw width-w cut
-        out.push(head);
-        word = word.slice(head.length);
-      }
-      if (line && VW(line) + 1 + VW(word) > w) {
-        out.push(line);
-        line = word;
-      } else {
-        line = line ? line + " " + word : word;
-      }
-    }
-    if (line) out.push(line);
-  }
-  return out;
-}
-
 const THINK_GREY: [number, number, number] = [120, 120, 120]; // done = muted
 
 function fmtDur(ms: number): string {
   const s = Math.max(1, Math.round(ms / 1000));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
-}
-
-// active -> ember border + "thinking"; done -> grey border + "thought for Xs".
-function buildBox(text: string, width: number, theme: any, active: boolean, ms: number): string[] {
-  const boxW = Math.max(20, width); // full available width
-  const inner = Math.max(10, boxW - 4); // 2 border + 2 pad
-  const rows = wrap(text.trim(), inner); // full reasoning, no cap
-  const c = active ? P.base : THINK_GREY;
-  const b = (s: string) => tc(c[0], c[1], c[2], s);
-  const title = active ? " ✷ thinking " : ` ✷ thought for ${fmtDur(ms)} `;
-  const top = b("╭" + title + "─".repeat(Math.max(0, boxW - 2 - VW(title))) + "╮");
-  const bot = b("╰" + "─".repeat(boxW - 2) + "╯");
-  const body = rows.map((l) => {
-    // Measure what thinkInline ACTUALLY emits, not a guess -- an unpaired
-    // backtick (mid-stream code span not yet closed) survives styling, so
-    // assuming backticks always vanish undercounts width by 1 and overflows.
-    const styled = thinkInline(l, theme);
-    const pad = " ".repeat(Math.max(0, inner - VW(styled)));
-    return b("│ ") + styled + pad + b(" │");
-  });
-  return [top, ...body, bot];
 }
 
 // Live AssistantMessageComponents, for recoloring history on palette change.
@@ -934,7 +867,6 @@ async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: 
   const themeMod: any = await import(url("dist/modes/interactive/theme/theme.js"));
   const syntMod: any = await import(url("dist/utils/syntax-highlight.js"));
   VW = tui.visibleWidth;
-  TTW = tui.truncateToWidth;
   host = { tui, T: themeMod.theme, themeMod, stackMod, syntMod };
 
   // Patch allocateStackSizes once: when roundedBox is on and footer renders 0 lines,
@@ -1059,7 +991,7 @@ async function patchThinking(): Promise<void> {
       const title = !t0
         ? " thought "
         : active
-          ? ` thinking ${fmtDur(ms)} `
+          ? ` thinking for ${fmtDur(ms)} `
           : ` thought for ${fmtDur(ms)} `;
       const top = b("╭" + "─".repeat(Math.max(0, width - 2)) + "╮");
       const bot = b("╰" + "─".repeat(Math.max(0, width - 4 - VW(title))) + title + "──╯");

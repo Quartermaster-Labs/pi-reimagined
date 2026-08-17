@@ -53,7 +53,7 @@ This repo is the publishable copy. Edits here must be mirrored to the live dir t
   right, palette divider. Sweep runs once at startup then settles to plain gradient.
 - **Inline thinking box** — monkeypatches `AssistantMessageComponent.prototype.updateContent`
   (only the thinking branch) so reasoning renders in a live rounded box with timing in the
-  **bottom-right** border (" thinking Xs " counting live while active, " thought for Xs "
+  **bottom-right** border (" thinking for Xs " counting live while active, " thought for Xs "
   grey when done). `collapseThinking` toggle hides thinking behind a muted italic label.
   Context untouched.
   - Timing is keyed on the **component** (`this._thinkStart/_thinkEnd`), set in
