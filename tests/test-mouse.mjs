@@ -10,7 +10,7 @@ const { Editor, visibleWidth } = await import(pathToFileURL(`${PI_TUI}/index.js`
 const { wordWrapLine } = await import(pathToFileURL(`${PI_TUI}/components/editor.js`).href);
 
 // --- extract the mouse section from the extension source ---
-const src = readFileSync(new URL("./pi-reimagined.ts", import.meta.url), "utf8");
+const src = readFileSync(new URL("../pi-reimagined.ts", import.meta.url), "utf8");
 const start = src.indexOf("// ---- Mouse:");
 // Stop before the TEMP diagnostics block (uses host-side fs helpers); fall
 // back to the patch function when the temp block has been removed.

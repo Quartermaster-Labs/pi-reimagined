@@ -49,12 +49,12 @@ Requires Node >= 22.19 (same as pi).
 
 ## Known limitations
 
-- **Path-coupled host imports.** Some effects (inline thinking box, palette
-  recolor of host components) deep-import pi internals by absolute path under
-  `%APPDATA%/npm/node_modules/@earendil-works/pi-coding-agent`. This is
-  Windows/npm-global specific and will not resolve on other layouts (mac/linux,
-  local installs) as-is. Needs a portable host-path resolver before a real
-  publish.
+- **Bundled pi builds.** The effects that monkey-patch host internals (inline
+  thinking box, code-block boxes, input mouse, palette recolor) deep-import pi's
+  dist files from the running install, located by walking up from the process
+  entry point. Standard npm/pnpm installs on Windows, macOS and Linux (global,
+  local, dev checkout) work as-is; a single-file/bundled pi build (no on-disk
+  `dist/`) degrades to the base UI without those effects.
 - Terminal-native scrollback that has already been committed (above the active
   render region) does not always recolor on a live palette switch.
 

@@ -18,6 +18,19 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
 
 ## Architecture
 
+- **Portable host-root resolution.** All monkey-patches deep-import pi internals
+  by absolute `file://` URL and MUST hit the copy the host is RUNNING on (theme
+  proxy + class prototypes are per-module-instance; a second copy patches
+  nothing). `resolveHostRoot()` walks up from `process.argv[1]`'s realpath to the
+  nearest ancestor package.json named `@earendil-works/pi-coding-agent`, verifying
+  the deep-import surface (`dist/modes/interactive/theme/theme.js`) exists — the
+  running process's entry module sits inside the pi install for every standard
+  layout (Windows/macOS/Linux npm global, local, pnpm/bun global, dev checkout).
+  Legacy Windows `%APPDATA%\npm` path is the last-resort fallback; null → the
+  deep-import effects degrade away (base UI still works). All five deep-import
+  sites (loadHost, captureInteractiveMode, patchThinking, patchNotifications,
+  piVersion) go through it. Sync on purpose (piVersion needs it in a render
+  callback). Regression: `node tests/test-host-resolver.mjs`.
 - **Fullscreen mode.** `captureInteractiveMode()` patches `InteractiveMode.prototype.renderWidgets`
   to capture the singleton instance. `session_start` calls `switchTuiMode("fullscreen")`
   to activate pi's native `TuiAltScreen` — built-in ScrollView with `follow: "end"` (auto-
@@ -130,7 +143,7 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
   running host uses the `%APPDATA%\npm` one that `loadHost()` patches. Cross-copy
   `instanceof` never matches (class identity verified FALSE). Duck-type by name/shape
   whenever you need to recognize host classes.
-  Regression harness: `node test-mouse.mjs` — drives the real host `Editor` (from the
+  Regression harness: `node tests/test-mouse.mjs` — drives the real host `Editor` (from the
   `%APPDATA%\npm` pi-tui copy) through the extracted `findEditorBoxAt` +
   `editorClickTarget` (fake frame: VStack root → leaf Container box holding the
   editor) for wrapping, CJK wide chars, `scrollOffset`, the rounded box, and
@@ -163,8 +176,10 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
 
 - The package `exports` map only exposes public entrypoints (`.`, `./rpc-entry`,
   `./client`) — no host internals. Host internals are deep-imported by absolute
-  `file://` URL under `%APPDATA%/npm/node_modules/@earendil-works/pi-coding-agent`.
-  Memoized in `loadHost()`. **This is the main publish blocker** — Windows/npm-global only.
+  `file://` URL under the root found by `resolveHostRoot()` (portable: argv[1]
+  walk-up + legacy Windows fallback — see Architecture). Memoized in `loadHost()`.
+  Remaining non-portable case: single-file/bundled pi builds (bun binary) have no
+  on-disk `dist/` — the deep-import effects degrade away, base UI still works.
 - `ctx.ui.setTheme` only invalidates; it does NOT rebuild host components. Components bake
   theme colors at construction. To recolor history we re-run `updateContent` on tracked
   `liveMsgs`, or use a live-rendering component that re-reads the theme proxy each render.
@@ -211,8 +226,11 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
 ## Testing
 
 - `node --check pi-reimagined.ts` — TS syntax gate (fast first check).
-- `node test-mouse.mjs` — mouse regression harness (editor box probing + click
-  targeting; wrapping, CJK wide chars, scrollOffset, rounded box, container probing).
+- `node tests/test-mouse.mjs` — mouse regression harness (editor box probing +
+  click targeting; wrapping, CJK wide chars, scrollOffset, rounded box, container
+  probing; needs a local host copy under `%APPDATA%\npm`).
+- `node tests/test-host-resolver.mjs` — host-root resolver regression (mac/linux/
+  pnpm/bun/dev/win fixture trees, negatives, real-disk fallback chain).
 - Everything else verified live in pi: after editing, copy `pi-reimagined.ts` to
   `~/.pi/agent/extensions/` and **fully restart pi** (new process; extension reload
   does not re-fire `session_start` or re-emit startup notifications).

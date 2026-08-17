@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-import { join, basename } from "node:path";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
 
 // pi reimagined: rounded input box, glow working text, sparkle spinner,
@@ -125,16 +125,72 @@ function saveCfg(): void {
   }
 }
 
+// --- host package root resolution (portable) --------------------------------
+// Every monkey-patch + palette recolor deep-imports pi internals by absolute
+// file:// URL and MUST hit the copy the host is RUNNING on: the theme proxy
+// and class prototypes are per-module-instance, so importing a second copy
+// patches nothing. The process's own entry module (process.argv[1]) sits
+// inside the pi install for every standard layout — Windows/macOS/Linux npm
+// global, local installs, pnpm/bun globals, dev checkouts (bin -> dist/cli.js)
+// — so walk up from its realpath to the nearest ancestor package.json named
+// @earendil-works/pi-coding-agent. The legacy Windows npm-global path is the
+// last resort (odd embedded launches); null otherwise -> the deep-import
+// effects degrade away (base UI still works). Sync on purpose: piVersion()
+// needs it inside a render callback, so no dynamic imports here.
+const HOST_PKG_NAME = "@earendil-works/pi-coding-agent";
+let hostRootCache: string | null | undefined;
+function resolveHostRoot(): string | null {
+  if (hostRootCache !== undefined) return hostRootCache;
+  hostRootCache = findHostRootFromPath(process.argv[1]) ?? legacyWindowsHostRoot();
+  return hostRootCache;
+}
+
+function findHostRootFromPath(entry: string | undefined): string | null {
+  if (!entry) return null;
+  let start: string;
+  try {
+    start = realpathSync(entry);
+  } catch {
+    start = entry; // unreadable (bin deleted mid-run?) — try as-is
+  }
+  // entry may be the package dir itself (node /path/to/pi) or a file inside.
+  let dir = existsSync(join(start, "package.json")) ? start : dirname(start);
+  for (;;) {
+    const hit = pkgRootNamed(dir);
+    if (hit) return hit;
+    const up = dirname(dir);
+    if (up === dir) return null; // reached filesystem root
+    dir = up;
+  }
+}
+
+// dir has a package.json named @earendil-works/pi-coding-agent AND the
+// deep-import surface present (guards half-built dev checkouts).
+function pkgRootNamed(dir: string): string | null {
+  try {
+    if (JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name !== HOST_PKG_NAME) return null;
+  } catch {
+    return null; // no package.json here
+  }
+  return existsSync(join(dir, "dist", "modes", "interactive", "theme", "theme.js")) ? dir : null;
+}
+
+function legacyWindowsHostRoot(): string | null {
+  if (process.platform !== "win32") return null;
+  const root = join(
+    process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
+    "npm", "node_modules", HOST_PKG_NAME,
+  );
+  return existsSync(join(root, "dist")) ? root : null;
+}
+
 // pi version, read once from the installed package.json (cheap, cached).
 let PI_VERSION = "";
 function piVersion(): string {
   if (PI_VERSION) return PI_VERSION;
   try {
-    const pkg = join(
-      process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
-      "npm", "node_modules", "@earendil-works", "pi-coding-agent", "package.json",
-    );
-    PI_VERSION = JSON.parse(readFileSync(pkg, "utf8")).version || "";
+    const root = resolveHostRoot();
+    if (root) PI_VERSION = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version || "";
   } catch {
     /* unreadable -> leave blank */
   }
@@ -833,10 +889,8 @@ function captureInteractiveMode(): void {
     const imMod: any = tui;
     // interactive-mode.js is not exported from pi-tui; deep-import it
     const { pathToFileURL } = require("node:url");
-    const pkg = join(
-      process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
-      "npm", "node_modules", "@earendil-works", "pi-coding-agent",
-    );
+    const pkg = resolveHostRoot(); // loadHost above already validated it
+    if (!pkg) return;
     const url = (p: string) => pathToFileURL(join(pkg, p)).href;
     import(url("dist/modes/interactive/interactive-mode.js")).then((im: any) => {
       const origRenderWidgets = im.InteractiveMode.prototype.renderWidgets;
@@ -857,10 +911,8 @@ let stackPatched = false;
 async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: any }> {
   if (host) return host;
   const { pathToFileURL } = await import("node:url");
-  const pkg = join(
-    process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
-    "npm", "node_modules", "@earendil-works", "pi-coding-agent",
-  );
+  const pkg = resolveHostRoot();
+  if (!pkg) throw new Error("pi-coding-agent package root not found (non-standard layout)");
   const url = (p: string) => pathToFileURL(join(pkg, p)).href;
   const tui: any = await import(url("node_modules/@earendil-works/pi-tui/dist/index.js"));
   const stackMod: any = await import(url("node_modules/@earendil-works/pi-tui/dist/components/stack.js"));
@@ -906,10 +958,8 @@ let patched = false;
 async function patchThinking(): Promise<void> {
   if (patched) return;
   const { pathToFileURL } = await import("node:url");
-  const pkg = join(
-    process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
-    "npm", "node_modules", "@earendil-works", "pi-coding-agent",
-  );
+  const pkg = resolveHostRoot();
+  if (!pkg) return; // host internals unavailable
   const url = (p: string) => pathToFileURL(join(pkg, p)).href;
   const am: any = await import(url("dist/modes/interactive/components/assistant-message.js"));
   const { tui, T } = await loadHost();
@@ -1083,10 +1133,8 @@ async function patchNotifications(): Promise<void> {
   if (patchedNotif) return;
   patchedNotif = true;
   const { pathToFileURL } = await import("node:url");
-  const pkg = join(
-    process.env.APPDATA || join(process.env.USERPROFILE || ".", "AppData", "Roaming"),
-    "npm", "node_modules", "@earendil-works", "pi-coding-agent",
-  );
+  const pkg = resolveHostRoot();
+  if (!pkg) return; // host internals unavailable
   const url = (p: string) => pathToFileURL(join(pkg, p)).href;
   const im: any = await import(url("dist/modes/interactive/interactive-mode.js"));
   const db: any = await import(url("dist/modes/interactive/components/dynamic-border.js"));
