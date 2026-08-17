@@ -193,7 +193,9 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
 
 ## Conventions
 
-- Author / repo identity: **radu0120** (github.com/Radu0120). Never attribute to "inwound".
+- Identity: author is **radu0120** (github.com/Radu0120); the repo lives under the
+  **Quartermaster-Labs** GitHub org and npm org **@quartermaster-labs**
+  (same pattern as pi-on-demand-context).
 - No emoji. Text-presentation dingbats only (`✷ ✶ ✸ ✦ ○ ❀ ✿`); avoid glyphs that render
   as colored emoji or carry VS16.
 - Keep it lazy: shortest diff that works, mark deliberate shortcuts with `ponytail:` comments.

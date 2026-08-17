@@ -1,5 +1,5 @@
 {
-  "name": "pi-reimagined",
+  "name": "@quartermaster-labs/pi-reimagined",
   "version": "0.1.0",
   "description": "A reimagined TUI for the pi coding agent: rounded input box with live border status, glowing working text, sparkle spinner, turn stats, inline thinking box, rounded code-block boxes with syntax highlighting, mouse support in the chat input, a custom PI startup header, and switchable palettes (ember / void / ocean / forest).",
   "type": "module",
@@ -31,14 +31,17 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
-  "author": "radu0120",
+  "author": "Radu0120 (https://github.com/Radu0120)",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Radu0120/pi-reimagined.git"
+    "url": "https://github.com/Quartermaster-Labs/pi-reimagined.git"
   },
   "bugs": {
-    "url": "https://github.com/Radu0120/pi-reimagined/issues"
+    "url": "https://github.com/Quartermaster-Labs/pi-reimagined/issues"
   },
-  "homepage": "https://github.com/Radu0120/pi-reimagined#readme"
+  "homepage": "https://github.com/Quartermaster-Labs/pi-reimagined#readme"
 }

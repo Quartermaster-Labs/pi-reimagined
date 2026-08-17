@@ -23,7 +23,7 @@ Toggle any feature or switch palette via `/pi-reimagined`; configure border stat
 Via pi (recommended):
 
 ```
-pi install npm:pi-reimagined
+pi install npm:@quartermaster-labs/pi-reimagined
 ```
 
 Or manually: copy `pi-reimagined.ts` into your pi extensions dir and the four
