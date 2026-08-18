@@ -100,6 +100,30 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
   rewritten with live `LiveText` bodies + `DynamicBorder` accent borders that re-read the shared
   theme proxy per render, so the boxes follow the active palette. (Version box drops OSC8
   hyperlink + Markdown note rendering — ponytail: URL stays visible as text.)
+- **Mode line (mode-extension adapter)** — Claude-Code-style line on the host's
+  `belowEditor` widget slot (`ctx.ui.setWidget("pi-reimagined:mode", …, {placement: "belowEditor"})`),
+  rendering active modes reported by OTHER extensions (plan/auto/…); when none are
+  active it always falls back to `⏸ manual` (the line is never empty while the
+  `modeLine` toggle is on). Labels read `<icon> <mode> mode on` (Claude Code
+  style; manual/plan use a double space — their icons read tight at one).
+  Per-mode icon + FIXED rgb (independent of palette, CC parity: manual
+  grey 156,163,175 / plan teal 45,212,191 / auto yellow 234,179,8 / auto-accept
+  purple 168,85,247) in `MODE_META`; icons: ⏸ manual / ⏺ plan / ⏵⏵ auto +
+  auto-accept (final user pick after the color-emoji attempt — in their terminal
+  ⏸ renders as the color pause box while ⏺/⏵ render plain, which is accepted),
+  overridable per key via `cfg.modeGlyphs`; unknown modes get palette star + grey.
+  Two adapters: (1) event contract — `pi.events.emit("pi-reimagined:mode", {key, label?, active})`
+  on change + answering our `pi-reimagined:mode:hello` (emitted on session_start) with current state
+  for load-order independence; (2) status mirror — `InteractiveMode.prototype.setExtensionStatus`
+  is patched (in `captureInteractiveMode`) so `ctx.ui.setStatus("plan-mode", …)` (the key the pi
+  plan-mode example uses) maps to a mode label via `cfg.modeAliases` (default
+  `{"plan-mode": "plan"}`); `footerDataProvider.clearExtensionStatuses` is instance-wrapped on
+  instance capture because `resetExtensionUI` bypasses setExtensionStatus on clears.
+  The widget component duck-types pi-tui (invalidate/dispose/render) and reads `modeStates`
+  (Map key→label) + `host.T` LIVE per render — label/palette changes repaint without
+  re-registering; `refreshModeLine()` only toggles widget presence. `modeWidgetLive` tracks
+  presence so label-only updates don't churn `renderWidgets()`. Toggle: `/pi-reimagined > Mode line`.
+  Contract + config documented in README "Mode line" section.
 - **Mouse in the chat input** — `TuiAltScreen` consumes every mouse event itself
   (left = screen selection, wheel = scroll, right = win32 paste anywhere, ignores
   x/y); the editor component never sees mouse input. `patchEditorMouse()` patches
@@ -184,8 +208,24 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
   per chunk + `completion_tokens_details.reasoning_tokens` in the backend.)
   Toggle: `/pi-reimagined > Turn stats`.
 - **Footer** — custom `setFooter` single-line status bar (path, progress, model). Hidden
-  (returns empty) when `roundedBox` is on; `allocateStackSizes` is patched to force
-  footer minSize to 0 so no blank line leaks.
+  (returns empty) when `roundedBox` is on. The host's fullscreen dock reserves the footer
+  slot with a hardcoded `minSize: 1`, which leaks a blank line under the mode line while
+  the footer renders empty. Fix: mutate that entry's `minSize` **live** — the dock entries
+  are plain objects in `VStack.entries` that `allocateStackSizes` reads fresh every frame,
+  so `syncFooterSlot()` flips `minSize` to 0/1 and the next render reflows. The entry is
+  found by walking `interactiveModeInstance.fullscreenLayoutRoot` (built in the host
+  `init()`, before `session_start`) down to the footer container. GOTCHA: `ctx` does NOT
+  expose the footer container — the ref must come from the captured host instance
+  (`interactiveModeInstance.footerContainer`, a private class field); `ctx.footerContainer`
+  was always undefined. Earlier we tried to monkey-patch `allocateStackSizes`'s export —
+  that is DEAD (see Key host facts: ESM namespace is frozen); it never ran and the
+  permanent blank line under the input survived for a while because of it. RELOAD
+  GOTCHA: `/reload` fires `session_shutdown` with `reason: "reload"` followed by
+  `session_start` — the layout and its dock entry SURVIVE, so the shutdown handler
+  must NOT restore `minSize: 1` on reload (that re-opened the blank line); and a
+  re-imported module's `session_start` can fire before its first `renderWidgets`
+  capture, so `syncFooterSlot()` self-heals by re-capturing when the entry ref is
+  lost (capture is sync-free to keep that recursion-safe).
 - **Scrollbar** — `scrollbarStyle` set to palette base RGB; `wheelScrollLines` boosted to 3.
 - **Config** — `~/.pi/agent/pi-reimagined.config.json` (feature toggles + palette +
   granular `BorderStatus` + `barStyle`). `BorderStatus` is either `true` (all defaults) or a partial
@@ -211,9 +251,13 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
   host; `loadHost().T` is the same object `setTheme` mutates.
 - Notifications fire once at process start (`run()` after `init()`), so the monkeypatch
   installed in `session_start` is in place before they fire.
-- `allocateStackSizes` (from `pi-tui/dist/components/stack.js`) can be patched to override
-  per-entry `minSize`. We use it to collapse the footer container to 0 lines when
-  `roundedBox` is on (host default is minSize:1, which leaves a blank line).
+- pi-tui `VStack`/`Stack` entries are **plain mutable objects** in `stack.entries`; the
+  layout reads each entry's `minSize`/`maxSize`/`shrink` fresh on every render. To change a
+  slot's reserved size at runtime, mutate the entry in place (that's how the footer slot
+  collapses — see Footer). Do NOT try to monkey-patch `allocateStackSizes`'s module export:
+  the deep-imported `stack.js` is an ESM namespace object whose exports are frozen
+  (assignment throws, swallowed by our catch) and pi's own `layout.js` holds a live import
+  binding to the original — the patched export never runs. Regression: `node tests/test-layout.mjs`.
 - `execSync` **inherits stderr by default** (stdio `['ignore','pipe','inherit']`), unlike `spawnSync`. A child's stderr (e.g. git CRLF warnings from `git diff` under `core.autocrlf`) writes raw to the TTY, painting over the fullscreen UI and desyncing the renderer's diff → full redraws. Always pass `stdio: ["ignore","pipe","ignore"]` on extension-side `execSync` calls.
 - `theme.fg("warning", …)` is amber in every shipped palette — don't use it for anything
   meant to be palette-tinted; use `accent`.
@@ -252,6 +296,10 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
   probing; needs a local host copy under `%APPDATA%\npm`).
 - `node tests/test-host-resolver.mjs` — host-root resolver regression (mac/linux/
   pnpm/bun/dev/win fixture trees, negatives, real-disk fallback chain).
+- `node tests/test-layout.mjs` — footer-slot minSize mechanism (frozen ESM namespace
+  proves the old export patch dead; live `Stack.entries` mutation collapses the footer
+  slot; capture walk over a host-shaped `VStack([scroll, VStack(dock)])`; needs a local
+  host copy under `%APPDATA%\npm`).
 - Everything else verified live in pi: after editing, copy `pi-reimagined.ts` to
   `~/.pi/agent/extensions/` and **fully restart pi** (new process; extension reload
   does not re-fire `session_start` or re-emit startup notifications).

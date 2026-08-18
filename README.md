@@ -15,6 +15,7 @@ One extension + four themes that restyle the interactive mode.
 - **Mouse in the chat input** — click to place the cursor, right-click to paste; highlight-to-copy still works.
 - **Switchable palettes** with live hover preview: `ember` (default), `void`, `ocean`, `forest`. Each pairs brand RGB with a matching theme.
 - **Palette-aware update notices** — version + package update banners recolored to follow the active palette instead of a fixed amber.
+- **Mode line** — the free line under the input shows active modes (`✷ plan`) reported by mode extensions (plan/auto/etc.), Claude-Code style; empty when no mode is active.
 
 Toggle any feature or switch palette via `/pi-reimagined`; configure border status elements and bar style via `/status-bar`.
 
@@ -46,6 +47,67 @@ Requires Node >= 22.19 (same as pi).
 | void    | purple | `✦ ⋆` star + dots |
 | ocean   | blue   | `○ ◯` bubbles |
 | forest  | green  | `❀ ✿` bloom |
+
+## Mode line (mode-extension adapter)
+
+Pi has no built-in plan/auto modes, but extensions can add them. pi-reimagined
+renders any active mode on the line under the chat input (the host's
+`belowEditor` widget slot). When no extension reports a mode it falls back to
+Claude Code's default: `⏸ manual`.
+Two adapters, both opt-in on the mode extension's side:
+
+**1. Event contract (recommended).** Emit the current state on every change and
+answer the session hello (so it works regardless of extension load order):
+
+```ts
+pi.events.on("pi-reimagined:mode:hello", () => report());
+function report() {
+  pi.events.emit("pi-reimagined:mode", {
+    key: "plan",          // unique per extension
+    label: "plan",        // optional, defaults to key
+    active: planEnabled,  // false clears this key
+  });
+}
+```
+
+Multiple extensions can report different keys; all active labels render joined
+by ` · ` in report order.
+
+**Styling.** Each label reads `<icon> <mode> mode on` (Claude Code style,
+space between icon and text; manual/plan use a double space — their icons read tight at one). Each known mode gets an icon and a fixed label
+color (independent of the active palette): `⏸ manual` (grey), `⏺ plan` (teal),
+`⏵⏵ auto` (yellow), `⏵⏵ auto-accept` / `auto-accept-edits` (purple). Unknown
+modes render with the palette star in grey.
+
+Icon gotcha: whether a U+23xx media-control glyph (⏸ ⏹ ⏺ ⏩ …) renders in
+COLOR depends on your terminal font — if the primary font has a monochrome
+glyph for it, no emoji fallback happens (e.g. ⏺ can render as plain ○). Paste
+this line into the chat input to see which render in color in YOUR terminal:
+
+```
+⏸ ⏹ ⏺ ⏩ ⏪ ⏵ ⏭ ⏮ ⏯ ⏰ ⏳ ▶ 🔴 🔵 🟡 🟣
+```
+
+then override any mode's icon in `~/.pi/agent/pi-reimagined.config.json`:
+
+```json
+{ "modeGlyphs": { "plan": "🔴" } }
+```
+
+**2. Status mirror (no changes to the other extension).** If an extension
+already surfaces its mode via `ctx.ui.setStatus("plan-mode", ...)`, add an alias
+to `~/.pi/agent/pi-reimagined.config.json`:
+
+```json
+{ "modeAliases": { "plan-mode": "plan" } }
+```
+
+The bundled [plan-mode example](https://github.com/earendil-works/pi) ships with
+pi under `examples/extensions/plan-mode/` — copy the folder into
+`~/.pi/agent/extensions/plan-mode/`, restart, and `/plan` shows `✷ plan` under
+the input with no modification (the default alias already covers it).
+
+Toggle the line itself via `/pi-reimagined > Mode line (below input)`.
 
 ## Known limitations
 

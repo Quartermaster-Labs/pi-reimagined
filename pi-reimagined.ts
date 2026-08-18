@@ -36,6 +36,9 @@ interface Cfg {
   collapseThinking: boolean;
   customHeader: boolean;
   palette: string;
+  modeLine: boolean; // Claude-Code-style mode line under the input (mode adapter)
+  modeAliases: Record<string, string>; // ctx.ui.setStatus key -> mode label (status-mirror adapter)
+  modeGlyphs: Record<string, string>; // mode key -> glyph override (defaults: MODE_META)
 }
 const borderDefault: BorderStatus = { progress: true, percentage: true, path: true, model: true, branch: false, cacheHits: false, diffStats: false };
 function bsOn(key: keyof BorderStatus): boolean {
@@ -54,6 +57,9 @@ const cfg: Cfg = {
   collapseThinking: false,
   customHeader: true,
   palette: "ember",
+  modeLine: true,
+  modeAliases: { "plan-mode": "plan" }, // the plan-mode example shipped in pi's examples
+  modeGlyphs: {},
 };
 
 // --- palettes --------------------------------------------------------------
@@ -116,6 +122,10 @@ function loadCfg(): void {
     /* first run / unreadable -> keep defaults */
   }
   if (!BAR_STYLES.includes(cfg.barStyle as BarStyle)) cfg.barStyle = "blocks";
+  if (cfg.modeAliases == null || typeof cfg.modeAliases !== "object" || Array.isArray(cfg.modeAliases))
+    cfg.modeAliases = { "plan-mode": "plan" };
+  if (cfg.modeGlyphs == null || typeof cfg.modeGlyphs !== "object" || Array.isArray(cfg.modeGlyphs))
+    cfg.modeGlyphs = {};
 }
 function saveCfg(): void {
   try {
@@ -934,60 +944,168 @@ function captureInteractiveMode(): void {
     import(url("dist/modes/interactive/interactive-mode.js")).then((im: any) => {
       const origRenderWidgets = im.InteractiveMode.prototype.renderWidgets;
       im.InteractiveMode.prototype.renderWidgets = function (...args: any[]) {
-        if (!interactiveModeInstance) interactiveModeInstance = this;
+        if (!interactiveModeInstance) {
+          interactiveModeInstance = this;
+          // The host's resetExtensionUI clears statuses BYPASSING setExtensionStatus
+          // (direct footerDataProvider call) — mirror those clears for aliased keys.
+          const fpd = this.footerDataProvider;
+          if (fpd && !fpd.__modeMirrorPatched) {
+            fpd.__modeMirrorPatched = true;
+            const origClear = fpd.clearExtensionStatuses;
+            fpd.clearExtensionStatuses = function () {
+              for (const alias of Object.values(cfg.modeAliases ?? {})) setMode(alias, undefined, false);
+              return origClear.call(this);
+            };
+          }
+        }
         return origRenderWidgets.apply(this, args);
+      };
+      // Status-mirror adapter: ctx.ui.setStatus (keyed) -> mode line for aliased keys.
+      const origSetStatus = im.InteractiveMode.prototype.setExtensionStatus;
+      im.InteractiveMode.prototype.setExtensionStatus = function (key: string, text: any) {
+        const alias = cfg.modeAliases?.[key];
+        // Normalize to the alias (mode name) so the MODE_META icon/color lookup
+        // hits — matches the event-contract convention (key = mode name).
+        if (alias) setMode(alias, undefined, text !== undefined && text !== null);
+        return origSetStatus.apply(this, [key, text]);
       };
     }).catch(() => { /* deep import failed — non-fatal */ });
   }).catch(() => {});
 }
 
+// --- Mode line adapter (line under the chat input) -------------------------
+// Claude Code shows its current mode (manual/plan/auto) on the free line under
+// the input; pi has no built-in modes, but extensions can bring them. We render
+// the active modes in the host's belowEditor widget slot (exactly that line;
+// when no extension reports a mode it falls back to Claude Code's "manual")
+// and accept them from two adapters:
+//  1. Event contract (canonical, any extension):
+//       pi.events.emit("pi-reimagined:mode", { key: "plan", label: "plan", active: true })
+//     plus answering our session_start hello with the CURRENT state, so it works
+//     regardless of extension load order:
+//       pi.events.on("pi-reimagined:mode:hello", () => pi.events.emit("pi-reimagined:mode", { ... }))
+//  2. Status mirror (for extensions we can't patch, e.g. pi's bundled plan-mode
+//     example): ctx.ui.setStatus("plan-mode", ...) is recognized via
+//     cfg.modeAliases (status key -> label) through the setExtensionStatus patch.
+// The component reads state live per render, so label/palette changes repaint
+// without re-registering the widget.
+const modeStates = new Map<string, string>(); // key -> label, active modes only (insertion order)
+let modeCtx: any = undefined;
+let modeWidgetLive = false;
+// Per-mode icon + color. Final set (user-picked after ⏺ rendered as plain ○
+// in their terminal and color emojis were dropped): ⏸ manual / ⏺ plan /
+// ⏵⏵ auto + auto-accept. Icons are the media-control glyphs (⏸ renders as
+// the color pause box in the user's terminal; ⏺/⏵ render plain — accepted).
+// Label colors are FIXED rgb, independent of the active palette (manual grey
+// / plan teal / auto yellow / auto-accept purple). Override any icon via
+// cfg.modeGlyphs; per-terminal color rendering varies (test line in README).
+const MODE_META: Record<string, { glyph: string; rgb: RGB; gap?: number }> = {
+  // gap = spaces between icon and label (manual/plan icons read tight at 1)
+  manual: { glyph: "⏸", rgb: [156, 163, 175], gap: 2 },
+  plan: { glyph: "⏺", rgb: [45, 212, 191], gap: 2 },
+  auto: { glyph: "⏵⏵", rgb: [234, 179, 8] },
+  "auto-accept": { glyph: "⏵⏵", rgb: [168, 85, 247] },
+  "auto-accept-edits": { glyph: "⏵⏵", rgb: [168, 85, 247] },
+};
+const MODE_FALLBACK_RGB: RGB = [156, 163, 175]; // unknown modes: star + grey
+function modeMeta(key: string): { glyph: string; rgb: RGB; gap?: number } {
+  const m = MODE_META[key.toLowerCase().trim()];
+  return m ?? { glyph: P.star, rgb: MODE_FALLBACK_RGB };
+}
+function setMode(key: string, label: string | undefined, active: boolean): void {
+  if (!key) return;
+  if (active) modeStates.set(key, label || key);
+  else modeStates.delete(key);
+  refreshModeLine();
+}
+function refreshModeLine(): void {
+  const ui = modeCtx?.ui;
+  if (!ui?.setWidget) return;
+  const want = cfg.modeLine; // always live — falls back to "manual" when idle
+  if (want === modeWidgetLive) return; // label-only changes repaint via live render
+  modeWidgetLive = want;
+  ui.setWidget(
+    "pi-reimagined:mode",
+    want
+      ? () => ({
+          invalidate(): void {},
+          dispose(): void {},
+          render(_width: number): string[] {
+            if (!cfg.modeLine) return [];
+            const T = host?.T;
+            if (!T) return [];
+            const entries: Array<[string, string]> =
+              modeStates.size > 0 ? [...modeStates.entries()] : [["manual", "manual"]];
+            const parts = entries.map(([key, label]) => {
+              const meta = modeMeta(key);
+              const g = cfg.modeGlyphs[key.toLowerCase().trim()];
+              const glyph = typeof g === "string" && g ? g : meta.glyph;
+              return tc(meta.rgb[0], meta.rgb[1], meta.rgb[2], `${glyph}${" ".repeat(meta.gap ?? 1)}${label} mode on`);
+            });
+            // leading space = host editor paddingX, aligns with the box interior
+            return [" " + parts.join(T.fg("dim", " · "))];
+          },
+        })
+      : undefined,
+    { placement: "belowEditor" },
+  );
+}
+
 // Memoized deep-import of the host's internals. The package `exports` map only
 // exposes ".", so subpath imports must go by absolute file URL. Shared by the
 // thinking patch and the palette picker (both need pi-tui + the theme proxy).
-let host: { tui: any; T: any; themeMod: any; stackMod: any; syntMod: any } | undefined;
-let footerContainerRef: any = undefined; // captured from ctx during session_start
-let stackPatched = false;
-async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; stackMod: any }> {
+let host: { tui: any; T: any; themeMod: any; syntMod: any } | undefined;
+let footerContainerRef: any = undefined; // captured from the host instance during session_start
+let footerDockEntry: any = undefined; // the LIVE dock entry object for the footer slot
+async function loadHost(): Promise<{ tui: any; T: any; themeMod: any; syntMod: any }> {
   if (host) return host;
   const { pathToFileURL } = await import("node:url");
   const pkg = resolveHostRoot();
   if (!pkg) throw new Error("pi-coding-agent package root not found (non-standard layout)");
   const url = (p: string) => pathToFileURL(join(pkg, p)).href;
   const tui: any = await import(url("node_modules/@earendil-works/pi-tui/dist/index.js"));
-  const stackMod: any = await import(url("node_modules/@earendil-works/pi-tui/dist/components/stack.js"));
   const themeMod: any = await import(url("dist/modes/interactive/theme/theme.js"));
   const syntMod: any = await import(url("dist/utils/syntax-highlight.js"));
   VW = tui.visibleWidth;
-  host = { tui, T: themeMod.theme, themeMod, stackMod, syntMod };
+  host = { tui, T: themeMod.theme, themeMod, syntMod };
+  return host;
+}
 
-  // Patch allocateStackSizes once: when roundedBox is on and footer renders 0 lines,
-  // override minSize for the footerContainer entry so it collapses to 0 instead
-  // of the host's minSize: 1 (which leaves a blank line).
-  if (!stackPatched) {
-    stackPatched = true;
-    try {
-      const origAllocate = stackMod.allocateStackSizes;
-      stackMod.allocateStackSizes = function (...args: any[]) {
-        const [entries, intrinsicSizes] = args as [any[], number[]];
-        if (cfg.roundedBox && footerContainerRef) {
-          for (const entry of entries) {
-            if (entry.component === footerContainerRef) {
-              const prev = entry.minSize;
-              entry.minSize = 0;
-              const result = origAllocate(...args);
-              entry.minSize = prev;
-              return result;
-            }
-          }
-        }
-        return origAllocate(...args);
-      };
-    } catch {
-      /* already patched or non-configurable — ignore */
+// --- Footer slot minSize ----------------------------------------------------
+// The host builds the fullscreen dock in init() with a hardcoded
+// `{ component: this.footerContainer, shrink: 1, minSize: 1 }` — the slot keeps
+// reserving 1 line even when our footer renders [] (the blank line under the
+// mode line). Patching stack.js's `allocateStackSizes` export never worked: the
+// ESM namespace is frozen (the assignment throws, swallowed) and layout.js
+// binds the original import anyway. But `Stack.entries` are PLAIN OBJECTS read
+// live every frame (`clampSize`/`distribute` read `entry.minSize ?? 0`), so
+// mutating the entry's minSize in place takes effect immediately.
+function footerIsEmpty(): boolean {
+  // mirrors the footer render() empty conditions
+  if (cfg.roundedBox || !cfg.borderStatus) return true;
+  return !(bsOn("path") || bsOn("progress") || bsOn("percentage") || bsOn("model"));
+}
+function syncFooterSlot(): void {
+  if (!footerDockEntry) captureFooterDockEntry(); // self-heal (capture is sync-free, no recursion)
+  if (!footerDockEntry) return;
+  footerDockEntry.minSize = footerIsEmpty() ? 0 : 1;
+}
+function captureFooterDockEntry(): void {
+  footerDockEntry = undefined;
+  // On /reload the (re-imported) module's session_start can fire before its
+  // first renderWidgets capture — re-derive the ref from the instance if set.
+  if (!footerContainerRef) footerContainerRef = interactiveModeInstance?.footerContainer;
+  const root = interactiveModeInstance?.fullscreenLayoutRoot;
+  if (!footerContainerRef || !Array.isArray(root?.entries)) return;
+  for (const e of root.entries) {
+    const sub = e.component?.entries; // the dock is a VStack with its own entries
+    if (!Array.isArray(sub)) continue;
+    const f = sub.find((x: any) => x.component === footerContainerRef);
+    if (f) {
+      footerDockEntry = f;
+      break;
     }
   }
-
-  return host;
 }
 
 // Patch the host's assistant-message renderer once. Replaces only the thinking
@@ -1657,7 +1775,7 @@ async function pickBarStyle(ctx: any): Promise<void> {
 
 // Toggle table drives both the menu and persistence.
 const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void; apply?: (ctx: any) => void }[] = [
-  { name: "Rounded input box", get: () => cfg.roundedBox, set: (v) => (cfg.roundedBox = v) },
+  { name: "Rounded input box", get: () => cfg.roundedBox, set: (v) => (cfg.roundedBox = v), apply: () => syncFooterSlot() },
   { name: "❯ prompt char", get: () => cfg.promptChar, set: (v) => (cfg.promptChar = v) },
   { name: "Glowing working text", get: () => cfg.glowText, set: (v) => (cfg.glowText = v) },
   { name: "Sparkle spinner", get: () => cfg.sparkleSpinner, set: (v) => (cfg.sparkleSpinner = v) },
@@ -1665,6 +1783,7 @@ const TOGGLES: { name: string; get: () => boolean; set: (v: boolean) => void; ap
   { name: "Live thinking box", get: () => cfg.thinkBox, set: (v) => (cfg.thinkBox = v) },
   { name: "Collapse thinking", get: () => cfg.collapseThinking, set: (v) => (cfg.collapseThinking = v), apply: (ctx: any) => rebuildLiveMessages() },
   { name: "Custom header", get: () => cfg.customHeader, set: (v) => (cfg.customHeader = v) },
+  { name: "Mode line (below input)", get: () => cfg.modeLine, set: (v) => (cfg.modeLine = v), apply: (ctx: any) => { modeCtx = ctx; refreshModeLine(); } },
 ];
 
 export default function (pi: ExtensionAPI) {
@@ -1674,8 +1793,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_e, ctx) => {
     if (ctx.mode !== "tui") return;
-    // Capture footer container for allocateStackSizes patch (collapse to 0 when roundedBox).
-    footerContainerRef = ctx.footerContainer;
+    // Footer slot: ctx doesn't expose footerContainer — read it off the captured
+    // host instance (captured during init(), before session_start fires), then
+    // find its live dock entry so syncFooterSlot can collapse the 1-line slot
+    // while the footer renders empty.
+    footerContainerRef = interactiveModeInstance?.footerContainer ?? ctx.footerContainer;
+    captureFooterDockEntry();
+    syncFooterSlot(); // capture no longer self-syncs
+    // Mode line: adopt this ctx and let mode extensions report their current state
+    // (load-order independent; they answer the hello with a pi-reimagined:mode emit).
+    modeCtx = ctx;
+    refreshModeLine();
+    pi.events.emit("pi-reimagined:mode:hello", { from: "pi-reimagined" });
     // Switch to pi's native fullscreen mode (TuiAltScreen) — replaces our manual
     // \x1b[?1049h / doRender patch with the built-in ScrollView, proper mouse
     // handling, cursor positioning, and differential rendering.
@@ -1704,7 +1833,8 @@ export default function (pi: ExtensionAPI) {
     }, 0);
 
     // Status lives in the box border. Footer is hidden when roundedBox is on
-    // (allocateStackSizes is patched to collapse footer to 0 lines).
+    // (the footer's dock slot minSize collapses to 0 while it renders empty —
+    // see syncFooterSlot).
     ctx.ui.setFooter((_tui: any, theme: any, footerData: any) => ({
       invalidate() {},
       dispose() {},
@@ -1848,9 +1978,19 @@ export default function (pi: ExtensionAPI) {
     im.showStatus(STAR + ` Worked for ${dur}${tok}${res}`);
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (e: any) => {
+    // /reload fires session_shutdown(reason:"reload") followed by session_start;
+    // the layout and its footer dock entry SURVIVE the reload, so restoring
+    // minSize:1 here would re-open the blank line until the next re-sync.
+    if (footerDockEntry && e?.reason !== "reload") {
+      footerDockEntry.minSize = 1; // restore host default before teardown
+    }
+    footerDockEntry = undefined;
     footerContainerRef = undefined;
     borderCtx = undefined;
+    modeStates.clear();
+    modeCtx = undefined;
+    modeWidgetLive = false;
     turnStart = null;
     settledTokens = 0;
     estTokens = 0;
@@ -1859,6 +1999,15 @@ export default function (pi: ExtensionAPI) {
     liveTokens = 0;
     liveReasoning = 0;
     if (borderCacheTimer) { clearInterval(borderCacheTimer); borderCacheTimer = null; }
+  });
+
+  // Mode-line adapter, tier 1: the event contract (see section above).
+  pi.events.on("pi-reimagined:mode", (d: any) => {
+    setMode(
+      String(d?.key ?? ""),
+      typeof d?.label === "string" && d.label ? d.label : undefined,
+      d?.active !== false,
+    );
   });
 
   // /pi-reimagined — toggle features. Loops until the user closes the menu.
@@ -1928,6 +2077,7 @@ export default function (pi: ExtensionAPI) {
         else break;
         saveCfg();
         applyEditor(ctx);
+        syncFooterSlot(); // elements off -> footer may render empty
         const name = choice.replace(/\[.\] /, "").split(" ")[0];
         ctx.ui.notify(`${name}: ${choice.includes("[x]") ? "on" : "off"}`);
       }
