@@ -158,9 +158,30 @@ you omit are DROPPED entirely, so both extensions and themes must stay listed.
 - **Turn stats (Claude Code style)** — `agent_start` records turn start (kept across
   auto-retry runs; only reset on `agent_settled`), `message_update` tracks the in-flight
   `usage.output`, `message_end` banks it into the turn total. The working text gets a
-  dimmed `(25s · ↓ 3.6k tokens)` suffix in both glow and plain modes. On `agent_settled`
-  the final message is already in the chat, so the host's own `showStatus()` (dim line +
-  spacer, dedupes back-to-back statuses) adds "✷ Worked for 53s" right under the turn.
+  dimmed `(25s · ↓ 2.4k tokens · 1.2k reasoning)` suffix in both glow and plain modes.
+  `usage.reasoning` is a SUBSET of output per the pi-ai `Usage` contract (verified
+  across provider code: Anthropic `output_tokens` ⊇ `thinking_tokens`, OpenAI
+  `completion_tokens` ⊇ `reasoning_tokens`, Google adds `thoughtsTokenCount` into
+  output) — the display uses a CLEAN SPLIT: `↓` shows non-reasoning output only
+  (`total − reasoning`), reasoning shown separately; the two numbers are disjoint and
+  sum to the raw output total (part omitted when nothing is reported; `↓ 0 tokens` is
+  dropped on pure-thinking messages).
+  **Live estimation:** most local/OpenAI-compatible backends send usage only in the
+  FINAL stream chunk (verified on llama-server b10483 via Quartermaster), which would
+  leave the counter flat the whole turn. So while no live usage is reported, tokens are
+  ESTIMATED from the streamed content chars (`streamedEstimate`: thinking + text +
+  toolCall partialJson ÷ `EST_CHARS_PER_TOKEN` 3.0, a compromise between GPT-family ~4
+  and CJK-efficient tokenizers ~2.5); real usage always replaces the estimate at
+  `message_end`. Estimated numbers carry a `~` prefix (`↓ ~3.6k tokens`); the reasoning
+  part falls back to the thinking-text estimate when the provider reports no breakdown.
+  On `agent_settled`
+  the final message is already in the chat (and the live suffix already vanished on
+  `agent_end`), so the host's own `showStatus()` (dim line + spacer, dedupes back-to-back
+  statuses) adds "✷ Worked for 53s · ↓ 2.4k tokens (1.2k reasoning)" right under the
+  turn — that line carries the final count. (On backends that never report a reasoning
+  breakdown, both numbers keep `~` forever: the raw total is real but the split is
+  estimated; the only way to fully clean numbers is a server-side fix — stream usage
+  per chunk + `completion_tokens_details.reasoning_tokens` in the backend.)
   Toggle: `/pi-reimagined > Turn stats`.
 - **Footer** — custom `setFooter` single-line status bar (path, progress, model). Hidden
   (returns empty) when `roundedBox` is on; `allocateStackSizes` is patched to force

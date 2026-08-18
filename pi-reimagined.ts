@@ -309,11 +309,41 @@ function glow(word: string, phase: number): string {
 }
 
 // --- turn stats (Claude Code style) ----------------------------------------
-// While working: "(25s · ↓ 3.6k tokens)" appended to the working text.
-// On settle: "✷ Worked for 53s" dim status line under the turn.
+// While working: "(25s · ↓ 2.4k tokens · 1.2k reasoning)" appended to the working
+// text. On settle: "✷ Worked for 53s · ↓ 2.4k tokens (1.2k reasoning)" under the turn.
+// Clean split: ↓ shows NON-reasoning output only (total − reasoning); reasoning
+// tokens are shown separately (they are a SUBSET of the raw output usage, so the
+// two displayed numbers are disjoint and sum to the total).
+// Most local/OpenAI-compatible backends send usage only in the FINAL stream chunk
+// (verified on llama-server b10483), which would leave the counter flat the whole
+// turn. So between deltas we ESTIMATE from the streamed content chars (Claude Code
+// does the same); real usage replaces the estimate at message_end. `~` marks
+// estimated numbers.
 let turnStart: number | null = null; // first agent_start; survives auto-retry runs
 let settledTokens = 0; // output tokens of finalized assistant messages this turn
+let estTokens = 0; // ...of which estimated (provider never reported usage)
+let settledReasoning = 0; // reasoning tokens of finalized assistant messages this turn
+let estReasoning = 0; // ...of which estimated (no reasoning breakdown reported)
 let liveTokens = 0; // output tokens of the in-flight assistant message
+let liveTokensEst = false; // ...estimated (no live usage from the provider)
+let liveReasoning = 0; // reasoning tokens of the in-flight assistant message
+let liveReasoningEst = false; // ...estimated (no reasoning breakdown reported)
+
+// Rough display-only factor; the real usage wins at message_end. 3.0 chars/token
+// is a compromise between GPT-family (~4) and efficient CJK tokenizers (~2.5).
+const EST_CHARS_PER_TOKEN = 3.0;
+
+function streamedEstimate(msg: any): { out: number; think: number } {
+  let text = 0;
+  let think = 0;
+  for (const b of msg?.content ?? []) {
+    if (b?.type === "thinking") think += b.thinking?.length ?? 0;
+    else if (b?.type === "text") text += b.text?.length ?? 0;
+    else if (b?.type === "toolCall")
+      text += (typeof b.partialJson === "string" ? b.partialJson : JSON.stringify(b.arguments ?? {})).length;
+  }
+  return { out: Math.round((text + think) / EST_CHARS_PER_TOKEN), think: Math.round(think / EST_CHARS_PER_TOKEN) };
+}
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -326,7 +356,16 @@ function turnStatsSuffix(): string {
   if (!cfg.turnStats || turnStart == null) return "";
   const s = Math.max(0, Math.floor((Date.now() - turnStart) / 1000));
   const t = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
-  return `${DIM_PRE} (${t} · ↓ ${fmtTokens(settledTokens + liveTokens)} tokens)${RST}`;
+  const total = settledTokens + liveTokens;
+  const reasoning = settledReasoning + liveReasoning;
+  const out = Math.max(0, total - reasoning); // non-reasoning output only
+  const totalEst = estTokens > 0 || (liveTokensEst && liveTokens > 0);
+  const reasoningEst = estReasoning > 0 || (liveReasoningEst && liveReasoning > 0);
+  const outEst = totalEst || reasoningEst; // out = total − (possibly estimated) reasoning
+  const bits = [t];
+  if (out > 0 || reasoning <= 0) bits.push(`↓ ${outEst ? "~" : ""}${fmtTokens(out)} tokens`);
+  if (reasoning > 0) bits.push(`${reasoningEst ? "~" : ""}${fmtTokens(reasoning)} reasoning`);
+  return `${DIM_PRE} (${bits.join(" · ")})${RST}`;
 }
 
 // sparkle spinner frames (rendered verbatim, so we add color).
@@ -1703,20 +1742,47 @@ export default function (pi: ExtensionAPI) {
     }));
   });
 
-  // Output-token accounting. usage.output updates per stream delta on providers
-  // that report it live (Anthropic); others fill it in at message end — the
-  // counter still lands correctly, just jumps instead of ticking.
+  // Output-token accounting. Providers that report usage live (Anthropic) tick
+  // the counter per delta; most others only report it in the final chunk, so we
+  // estimate from the streamed content until then (see streamedEstimate) — the
+  // estimate is display-only and always replaced by real usage at message_end.
+  // usage.reasoning (a subset of output) is shown as a breakdown; when the
+  // provider never reports it, the thinking-text estimate stands in, `~`-marked.
   pi.on("message_start", (e) => {
-    if (e.message.role === "assistant") liveTokens = 0;
+    if (e.message.role !== "assistant") return;
+    liveTokens = 0;
+    liveTokensEst = false;
+    liveReasoning = 0;
+    liveReasoningEst = false;
   });
   pi.on("message_update", (e) => {
-    if (e.message.role === "assistant") liveTokens = e.message.usage?.output ?? 0;
+    if (e.message.role !== "assistant") return;
+    const u = e.message.usage;
+    const est = streamedEstimate(e.message);
+    const rep = u?.output ?? 0;
+    liveTokens = rep > 0 ? rep : est.out;
+    liveTokensEst = rep <= 0;
+    const repR = u?.reasoning ?? 0;
+    liveReasoning = repR > 0 ? repR : est.think;
+    liveReasoningEst = repR <= 0;
   });
   pi.on("message_end", (e) => {
-    if (e.message.role === "assistant") {
-      settledTokens += e.message.usage?.output ?? 0;
-      liveTokens = 0;
+    if (e.message.role !== "assistant") return;
+    const u = e.message.usage;
+    const est = streamedEstimate(e.message); // stateless — also sane for replayed history
+    const rep = u?.output ?? 0;
+    settledTokens += rep > 0 ? rep : est.out;
+    if (rep <= 0) estTokens += est.out;
+    const repR = u?.reasoning ?? 0;
+    if (repR > 0) settledReasoning += repR;
+    else {
+      settledReasoning += est.think;
+      estReasoning += est.think;
     }
+    liveTokens = 0;
+    liveTokensEst = false;
+    liveReasoning = 0;
+    liveReasoningEst = false;
   });
 
   pi.on("agent_start", (_e, ctx) => {
@@ -1758,15 +1824,28 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", (_e, ctx) => {
     const start = turnStart;
     turnStart = null;
+    const total = settledTokens;
+    const reasoning = settledReasoning;
     settledTokens = 0;
     liveTokens = 0;
+    estTokens = 0;
+    settledReasoning = 0;
+    estReasoning = 0;
+    liveReasoning = 0;
     if (start == null || !cfg.turnStats || ctx.mode !== "tui") return;
     const im = interactiveModeInstance;
     if (!im?.chatContainer) return;
     const s = Math.max(1, Math.round((Date.now() - start) / 1000));
     const dur = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+    // The live suffix vanishes on agent_end before the final usage chunk is even
+    // ticked, so the settled line carries the final (real) count.
+    const out = Math.max(0, total - reasoning);
+    const outEst = estTokens > 0 || estReasoning > 0; // reasoning est taints the split
+    const resEst = estReasoning > 0;
+    const tok = out > 0 || reasoning <= 0 ? ` · ↓ ${outEst ? "~" : ""}${fmtTokens(out)} tokens` : "";
+    const res = reasoning > 0 ? ` (${resEst ? "~" : ""}${fmtTokens(reasoning)} reasoning)` : "";
     // showStatus bakes theme.fg("dim"); the star's embedded ANSI overrides it.
-    im.showStatus(STAR + ` Worked for ${dur}`);
+    im.showStatus(STAR + ` Worked for ${dur}${tok}${res}`);
   });
 
   pi.on("session_shutdown", () => {
@@ -1774,7 +1853,11 @@ export default function (pi: ExtensionAPI) {
     borderCtx = undefined;
     turnStart = null;
     settledTokens = 0;
+    estTokens = 0;
+    settledReasoning = 0;
+    estReasoning = 0;
     liveTokens = 0;
+    liveReasoning = 0;
     if (borderCacheTimer) { clearInterval(borderCacheTimer); borderCacheTimer = null; }
   });
 
